@@ -1,0 +1,55 @@
+# Python 3.12 environment for rooftop PV geospatial AI workflow
+# Install with: uv pip install -r requirements.txt
+
+# Core scientific computing
+numpy
+pandas
+scipy
+pyarrow
+
+# Geospatial vector stack
+geopandas
+shapely
+pyproj
+fiona
+pyogrio
+rtree
+osmnx
+
+# Raster and multidimensional analysis
+rasterio
+rioxarray
+xarray
+
+# Data engineering and local analytics
+# Includes DuckDB spatial extension support via SQL INSTALL/LOAD spatial
+duckdb
+duckdb-engine
+
+# Computer vision and segmentation
+scikit-image
+opencv-python
+scikit-learn
+
+# Geospatial data/API access
+requests
+pystac-client
+planetary-computer
+earthengine-api
+censusdis
+
+# Notebook and Jupytext development workflow
+jupyterlab
+ipykernel
+jupytext
+
+# Visualization and mapping
+matplotlib
+seaborn
+plotly
+folium
+lonboard
+
+# Utilities
+python-dotenv
+tqdm
