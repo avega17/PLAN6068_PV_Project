@@ -49,6 +49,7 @@ seaborn
 plotly
 folium
 lonboard
+contextily
 
 # Utilities
 python-dotenv

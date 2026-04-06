@@ -1,0 +1,4 @@
+.env
+notebooks/vectors/cache/*
+**/*.cpython-*
+**/*.duckdb
