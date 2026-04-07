@@ -1,4 +1,8 @@
 .env
-notebooks/vectors/cache/*
+notebooks/**/cache
+data/**/cache 
+
+
 **/*.cpython-*
 **/*.duckdb
+outputs/**/*.png

@@ -15,6 +15,7 @@ fiona
 pyogrio
 rtree
 osmnx
+quackosm==0.17.0
 
 # Raster and multidimensional analysis
 rasterio
@@ -23,7 +24,7 @@ xarray
 
 # Data engineering and local analytics
 # Includes DuckDB spatial extension support via SQL INSTALL/LOAD spatial
-duckdb
+duckdb<=1.4.4
 duckdb-engine
 
 # Computer vision and segmentation
