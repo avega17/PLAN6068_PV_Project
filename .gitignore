@@ -1,8 +1,10 @@
 .env
 notebooks/**/cache
-data/**/cache 
-
+data/**/cache/*
+cache/*
+outputs/geoparquet/*
+**/overture_bounding_boxes/
 
 **/*.cpython-*
 **/*.duckdb
-outputs/**/*.png
+# outputs/**/*.png

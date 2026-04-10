@@ -14,8 +14,16 @@ pyproj
 fiona
 pyogrio
 rtree
+
+# Openstreetmap, Overpass API, and PBF files
 osmnx
 quackosm==0.17.0
+overpy
+osmium
+
+# Overture Maps
+overturemaps
+overturemaestro
 
 # Raster and multidimensional analysis
 rasterio
@@ -42,6 +50,7 @@ censusdis
 # Notebook and Jupytext development workflow
 jupyterlab
 ipykernel
+ipywidgets
 jupytext
 
 # Visualization and mapping

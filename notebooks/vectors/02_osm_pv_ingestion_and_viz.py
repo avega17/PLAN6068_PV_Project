@@ -5,9 +5,11 @@
 # 
 # **Our Technical Approach**:
 # 1. **Geometry Filtering**: We query `osmnx` for the high-fidelity boundary of 'Puerto Rico' to constrain our search space.
-# 2. **Direct QuackOSM -> DuckDB Loading**: We use `quackosm.convert_geometry_to_duckdb()` to download matching OSM extracts and materialize rows directly into our DuckDB file and staging table.
-# 3. **DuckDB Spatial Cleaning**: We apply SQL filters for rooftop-PV semantics (including content exclusion for hot-water systems) and keep polygonal geometries only.
-# 4. **EDA + Mapping**: We summarize feature counts/areas and block coverage, then render a macro static map and a micro interactive Folium map using a contextily provider URL.
+# 2. **Direct QuackOSM -> DuckDB Loading**: We use `quackosm.convert_geometry_to_duckdb()` to download matching OSM extracts and materialize rows directly into DuckDB staging tables.
+# 3. **Expanded Stage Schema**: We set `keep_all_tags=True`, `explode_tags=True`, and `ignore_metadata_tags=False` to preserve all available tags plus metadata fields such as user and timestamp.
+# 4. **Dual Staging Targets**: We ingest one stage for rooftop-PV features and a second stage for larger solar-plant features (`plant:method=photovoltaic` OR `plant:source=solar`).
+# 5. **Local Metadata Enrichment**: We enrich metadata from a cached local `.osm.pbf` file for faster throughput than remote API calls.
+# 6. **DuckDB Spatial Cleaning + EDA + Mapping**: We clean rooftop PV polygons with SQL, summarize counts/areas/coverage, and render macro + interactive micro maps.
 
 # %%
 """02_osm_pv_ingestion_and_viz.py
@@ -39,6 +41,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import osmnx as ox
 import quackosm as qosm
+import pandas as pd
 import folium
 from folium.plugins import MarkerCluster
 from dotenv import load_dotenv
@@ -68,14 +71,26 @@ OUTPUT_CRS = "EPSG:4326"
 PLOT_CRS = "EPSG:3857"
 PV_TABLE_NAME = "pr_osm_rooftop_pv_polygons"
 PV_STAGE_TABLE_NAME = "pr_osm_quackosm_stage"
+SOLAR_PLANT_STAGE_TABLE_NAME = "pr_osm_solar_plant_stage"
 TARGET_MUNICIPALITY = "San Juan"
 
 QUACKOSM_TAGS_FILTER: dict[str, object] = {
-    "power": "generator",
+    "generator:method": "photovoltaic",
     "generator:source": "solar",
     "generator:type": "solar_photovoltaic_panel",
 }
+SOLAR_PLANT_TAGS_FILTER: dict[str, object] = {
+    "plant:method": "photovoltaic",
+    "plant:source": "solar",
+}
+QUACKOSM_KEEP_ALL_TAGS = True
+QUACKOSM_EXPLODE_TAGS = True
+QUACKOSM_IGNORE_METADATA_TAGS = False
 OSM_EXTRACT_SOURCE = os.getenv("OSM_EXTRACT_SOURCE", "any").strip() or "any"
+
+PV_FILTER_TAG_COLUMNS = ["generator:method", "generator:source", "generator:type"]
+PV_METADATA_COLUMNS = ["user", "timestamp", "uid", "version", "changeset"]
+LOCAL_METADATA_UPDATE_CHUNK_SIZE = 5000
 
 
 def slugify(value: str) -> str:
@@ -112,6 +127,27 @@ def resolve_cache_dir() -> Path:
     cache_dir = PROJECT_ROOT / "data" / "vectors" / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
+
+
+def resolve_cached_osm_pbf(cache_dir: Path) -> Path | None:
+    """Resolve a local cached OSM .osm.pbf path for fast metadata enrichment."""
+
+    explicit = os.getenv("OSM_PBF_PATH", "").strip()
+    if explicit != '':
+        explicit_path = Path(explicit)
+        if explicit_path.exists():
+            return explicit_path
+
+    candidates = sorted(cache_dir.glob("*.osm.pbf"))
+    if not candidates:
+        return None
+
+    preferred = [
+        path
+        for path in candidates
+        if "puerto_rico" in path.name.lower() or "puerto-rico" in path.name.lower()
+    ]
+    return preferred[0] if preferred else candidates[0]
 
 
 def create_spatial_connection(db_path: Path) -> duckdb.DuckDBPyConnection:
@@ -224,7 +260,11 @@ def run_extraction(
     geometry_filter: BaseGeometry,
     db_path: Path,
     cache_dir: Path,
+    tags_filter: dict[str, object],
     stage_table_name: str = PV_STAGE_TABLE_NAME,
+    keep_all_tags: bool = QUACKOSM_KEEP_ALL_TAGS,
+    explode_tags: bool = QUACKOSM_EXPLODE_TAGS,
+    ignore_metadata_tags: bool = QUACKOSM_IGNORE_METADATA_TAGS,
 ) -> dict[str, object]:
     """Run QuackOSM extraction directly into DuckDB and return timing metadata."""
     print("Running QuackOSM extraction via convert_geometry_to_duckdb...")
@@ -232,7 +272,8 @@ def run_extraction(
     print(f"Target staging table: {stage_table_name}")
     print(f"Working/cache directory: {cache_dir}")
     print(f"OSM extract source selection: {OSM_EXTRACT_SOURCE}")
-    print(f"QuackOSM tags filter: {QUACKOSM_TAGS_FILTER}")
+    print(f"QuackOSM tags filter: {tags_filter}")
+    print(f"keep_all_tags={keep_all_tags}, explode_tags={explode_tags}, ignore_metadata_tags={ignore_metadata_tags}")
 
     # Ensure shape is a strictly plain BaseGeometry without unexpected bindings:
     active_filter = geometry_filter.buffer(0)
@@ -242,9 +283,12 @@ def run_extraction(
     started = time.perf_counter()
     duckdb_result_path = qosm.convert_geometry_to_duckdb(
         geometry_filter=active_filter,
-        tags_filter=QUACKOSM_TAGS_FILTER,
+        tags_filter=tags_filter,
         osm_extract_source=OSM_EXTRACT_SOURCE,
         result_file_path=str(db_path),
+        keep_all_tags=keep_all_tags,
+        explode_tags=explode_tags,
+        ignore_metadata_tags=ignore_metadata_tags,
         duckdb_table_name=stage_table_name,
         working_directory=str(cache_dir),
         ignore_cache=False,
@@ -260,6 +304,7 @@ def run_extraction(
         "strategy": "quackosm_geometry_to_duckdb",
         "elapsed_seconds": round(elapsed, 2),
         "duckdb_path": str(duckdb_result_path),
+        "tags_filter": tags_filter,
         "stage_table": stage_table_name,
     }
 
@@ -276,23 +321,55 @@ def create_clean_pv_table(
     stage_schema = con.execute(f"PRAGMA table_info('{stage_table_name}')").fetchdf()
     stage_columns = set(stage_schema["name"].tolist())
 
+    def quoted_identifier(column_name: str) -> str:
+        return f'"{column_name.replace("\"", "\"\"")}"'
+
     def stage_text_expr(column_name: str) -> str:
         if column_name in stage_columns:
-            return f"lower(coalesce(CAST(\"{column_name}\" AS VARCHAR), ''))"
+            return f"lower(coalesce(CAST({quoted_identifier(column_name)} AS VARCHAR), ''))"
         return "''"
 
-    if "tags" in stage_columns:
-        power_expr = f"lower(coalesce(CAST(tags['power'] AS VARCHAR), {stage_text_expr('power')}))"
-        source_expr = f"lower(coalesce(CAST(tags['generator:source'] AS VARCHAR), {stage_text_expr('generator:source')}))"
-        type_expr = f"lower(coalesce(CAST(tags['generator:type'] AS VARCHAR), {stage_text_expr('generator:type')}))"
-        content_expr = f"lower(coalesce(CAST(tags['content'] AS VARCHAR), {stage_text_expr('content')}))"
-        tags_select_expr = "tags"
-    else:
-        power_expr = stage_text_expr("power")
-        source_expr = stage_text_expr("generator:source")
-        type_expr = stage_text_expr("generator:type")
-        content_expr = stage_text_expr("content")
-        tags_select_expr = "map_from_entries([]::STRUCT(k VARCHAR, v VARCHAR)[]) AS tags"
+    method_expr = stage_text_expr("generator:method")
+    source_expr = stage_text_expr("generator:source")
+    type_expr = stage_text_expr("generator:type")
+    content_expr = stage_text_expr("content")
+    hot_water_output_expr = stage_text_expr("generator:output:hot_water")
+
+    keep_stage_columns = [
+        column_name
+        for column_name in [*PV_FILTER_TAG_COLUMNS, *PV_METADATA_COLUMNS]
+        if column_name in stage_columns
+    ]
+
+    staged_select_items = [
+        "feature_id",
+        "CAST(geometry AS GEOMETRY) AS geometry",
+        f"{content_expr} AS content_value",
+        f"{method_expr} AS generator_method_value",
+        f"{source_expr} AS generator_source_value",
+        f"{type_expr} AS generator_type_value",
+        f"{hot_water_output_expr} AS generator_output_hot_water_value",
+        *[f"{quoted_identifier(column_name)} AS {quoted_identifier(column_name)}" for column_name in keep_stage_columns],
+    ]
+    municipality_ranked_items = [
+        "f.feature_id",
+        "f.geometry",
+        *[f"f.{quoted_identifier(column_name)} AS {quoted_identifier(column_name)}" for column_name in keep_stage_columns],
+        "m.NAME AS municipality_name",
+        "m.GEOID AS municipality_geoid",
+        "ROW_NUMBER() OVER (PARTITION BY f.feature_id ORDER BY ST_Area(ST_Intersection(m.geometry, f.geometry)) DESC NULLS LAST) AS municipality_rank",
+    ]
+    final_select_items = [
+        "feature_id",
+        "municipality_name",
+        "municipality_geoid",
+        *[quoted_identifier(column_name) for column_name in keep_stage_columns],
+        "geometry",
+    ]
+
+    staged_select_sql = ",\n                ".join(staged_select_items)
+    municipality_ranked_sql = ",\n                ".join(municipality_ranked_items)
+    final_select_sql = ",\n            ".join(final_select_items)
 
     print(f"Detected QuackOSM stage columns: {', '.join(sorted(stage_columns))}")
 
@@ -301,21 +378,16 @@ def create_clean_pv_table(
         CREATE OR REPLACE TABLE {table_name} AS
         WITH staged AS (
             SELECT
-                feature_id,
-                {tags_select_expr},
-                CAST(geometry AS GEOMETRY) AS geometry,
-                {content_expr} AS content_value,
-                {power_expr} AS power_value,
-                {source_expr} AS generator_source_value,
-                {type_expr} AS generator_type_value
+                {staged_select_sql}
             FROM {stage_table_name}
         ),
         filtered AS (
             SELECT *
             FROM staged
-            WHERE content_value <> 'hot_water'
+            WHERE content_value NOT IN ('hot_water', 'hot', 'water')
+              AND generator_output_hot_water_value <> 'yes'
               AND (
-                    power_value = 'generator'
+                    generator_method_value = 'photovoltaic'
                  OR generator_source_value = 'solar'
                  OR generator_type_value = 'solar_photovoltaic_panel'
               )
@@ -323,25 +395,13 @@ def create_clean_pv_table(
         ),
         municipality_ranked AS (
             SELECT
-                f.feature_id,
-                f.tags,
-                f.geometry,
-                m.NAME AS municipality_name,
-                m.GEOID AS municipality_geoid,
-                ROW_NUMBER() OVER (
-                    PARTITION BY f.feature_id
-                    ORDER BY ST_Area(ST_Intersection(m.geometry, f.geometry)) DESC NULLS LAST
-                ) AS municipality_rank
+                {municipality_ranked_sql}
             FROM filtered AS f
             LEFT JOIN pr_municipalities AS m
               ON ST_Intersects(m.geometry, f.geometry)
         )
         SELECT
-            feature_id,
-            municipality_name,
-            municipality_geoid,
-            tags,
-            geometry
+            {final_select_sql}
         FROM municipality_ranked
         WHERE municipality_rank = 1;
         """
@@ -349,6 +409,112 @@ def create_clean_pv_table(
     con.execute(f"DROP INDEX IF EXISTS idx_{table_name}_geometry;")
     con.execute(f"CREATE INDEX idx_{table_name}_geometry ON {table_name} USING RTREE (geometry);")
     print(f"Created cleaned table and RTree index: {table_name}")
+
+
+def enrich_stage_metadata_from_local_pbf(
+    con: duckdb.DuckDBPyConnection,
+    stage_table_name: str,
+    pbf_path: Path | None,
+    update_chunk_size: int = LOCAL_METADATA_UPDATE_CHUNK_SIZE,
+) -> None:
+    """Fetch OSM metadata from a local cached PBF file and update stage table metadata fields."""
+
+    if pbf_path is None or not pbf_path.exists():
+        print(f"No local .osm.pbf available for metadata enrichment in: {stage_table_name}")
+        return
+
+    feature_df = con.execute(
+        f"""
+        SELECT feature_id
+        FROM {stage_table_name}
+        WHERE feature_id LIKE 'way/%'
+        """
+    ).fetchdf()
+    if feature_df.empty:
+        print(f"No way features found to enrich in: {stage_table_name}")
+        return
+
+    way_ids = sorted(
+        {
+            int(feature_id.split("/", 1)[1])
+            for feature_id in feature_df["feature_id"].dropna().tolist()
+            if isinstance(feature_id, str) and feature_id.startswith("way/") and feature_id.split("/", 1)[1].isdigit()
+        }
+    )
+    if not way_ids:
+        print(f"No valid way IDs found for metadata enrichment in: {stage_table_name}")
+        return
+
+    try:
+        import osmium  # type: ignore
+    except ImportError:
+        print(
+            "pyosmium is not installed; skipping local metadata enrichment. "
+            "Install with: uv pip install pyosmium"
+        )
+        return
+
+    target_ids = set(way_ids)
+    updates: list[dict[str, str | int | None]] = []
+
+    class WayMetadataHandler(osmium.SimpleHandler):
+        def __init__(self, selected_ids: set[int]):
+            super().__init__()
+            self.selected_ids = selected_ids
+
+        def way(self, way):
+            way_id = int(way.id)
+            if way_id not in self.selected_ids:
+                return
+
+            updates.append(
+                {
+                    "way_id": way_id,
+                    "user": getattr(way, "user", None),
+                    "timestamp": str(getattr(way, "timestamp", "")) if getattr(way, "timestamp", None) else None,
+                    "uid": str(getattr(way, "uid", "")) if getattr(way, "uid", None) is not None else None,
+                    "version": str(getattr(way, "version", "")) if getattr(way, "version", None) is not None else None,
+                    "changeset": str(getattr(way, "changeset", "")) if getattr(way, "changeset", None) is not None else None,
+                }
+            )
+
+    print(
+        f"Reading local OSM metadata for {len(way_ids)} way features from {pbf_path.name} "
+        f"into {stage_table_name}"
+    )
+    handler = WayMetadataHandler(target_ids)
+    handler.apply_file(str(pbf_path), locations=False)
+
+    if not updates:
+        print(f"Local PBF parsing returned no metadata updates for: {stage_table_name}")
+        return
+
+    metadata_columns = ["user", "timestamp", "uid", "version", "changeset"]
+    for column_name in metadata_columns:
+        con.execute(f'ALTER TABLE {stage_table_name} ADD COLUMN IF NOT EXISTS "{column_name}" VARCHAR;')
+
+    metadata_updates = pd.DataFrame(updates).drop_duplicates(subset=["way_id"])
+    total_rows = len(metadata_updates)
+
+    for start in range(0, total_rows, update_chunk_size):
+        chunk = metadata_updates.iloc[start : start + update_chunk_size].copy()
+        con.register("metadata_updates", chunk)
+        con.execute(
+            f"""
+            UPDATE {stage_table_name} AS s
+            SET
+                "user" = coalesce(m.user, s."user"),
+                "timestamp" = coalesce(m.timestamp, s."timestamp"),
+                "uid" = coalesce(m.uid, s."uid"),
+                "version" = coalesce(m.version, s."version"),
+                "changeset" = coalesce(m.changeset, s."changeset")
+            FROM metadata_updates AS m
+            WHERE s.feature_id = 'way/' || CAST(m.way_id AS VARCHAR);
+            """
+        )
+        con.unregister("metadata_updates")
+
+    print(f"Updated local PBF metadata rows for {stage_table_name}: {total_rows}")
 
 
 def summarize_municipality_pv(con: duckdb.DuckDBPyConnection, table_name: str = PV_TABLE_NAME):
@@ -409,13 +575,16 @@ def summarize_block_coverage(con: duckdb.DuckDBPyConnection):
 def plot_eda_summary(municipality_summary, output_dir: Path) -> Path:
     """Save an EDA bar chart of top municipalities by PV feature count."""
 
-    top_muni = municipality_summary.head(15).iloc[::-1]
+    top_muni = municipality_summary.head(10).iloc[::-1]
     fig, ax = plt.subplots(figsize=(10, 8), constrained_layout=True)
     ax.barh(top_muni["municipality_name"], top_muni["pv_feature_count"], color="#16a34a")
-    ax.set_title("Top 15 municipalities by rooftop PV OSM feature count", pad=12, fontsize=13)
+    # add bar value labels
+    for i, count in enumerate(top_muni["pv_feature_count"]):
+        ax.text(count + 0.5, i, str(count), va="center", fontsize=9)
+    ax.set_title("Top 10 municipalities by rooftop PV OSM feature count", pad=12, fontsize=13)
     ax.set_xlabel("PV feature count")
-    output_path = output_dir / "pv_eda_top15_municipalities.png"
-    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    output_path = output_dir / "pv_eda_top10_municipalities.png"
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return output_path
 
@@ -556,20 +725,25 @@ def plot_micro_map(osm_features: gpd.GeoDataFrame, municipalities: gpd.GeoDataFr
     return micro_map
 
 # %%
+
+
 # %% [markdown]
 # ## Execution Steps
 # 1. Connect to the project DuckDB and load municipality boundaries.
-# 2. Resolve Puerto Rico geometry with OSMnx and ingest matching OSM features directly into DuckDB via QuackOSM.
-# 3. Build cleaned PV polygons from the QuackOSM stage table using SQL tag logic.
-# 4. Update `has_PV` flags, run EDA summaries, and export macro + interactive micro maps.
+# 2. Resolve Puerto Rico geometry with OSMnx and ingest matching rooftop-PV + solar-plant OSM features directly into DuckDB via QuackOSM.
+# 3. Enrich stage metadata from local cached OSM PBF and validate stage schemas/samples.
+# 4. Build cleaned rooftop PV polygons from the QuackOSM stage table using SQL tag logic.
+# 5. Update `has_PV` flags, run EDA summaries, and export macro + interactive micro maps.
 
 # %%
 # Step 1: initialize paths + connection.
 DB_PATH = resolve_db_path()
 OUTPUT_DIR = resolve_output_dir()
 CACHE_DIR = resolve_cache_dir()
+OSM_PBF_PATH = resolve_cached_osm_pbf(CACHE_DIR)
 con = create_spatial_connection(DB_PATH)
-print(f"Connected to vector database: {DB_PATH}")
+print(f"Connected to duckdb database: {DB_PATH}")
+print(f"Local OSM PBF for metadata enrichment: {OSM_PBF_PATH if OSM_PBF_PATH else 'not found'}")
 tables_before_quackosm = list_db_tables(con)
 print("Tables available before QuackOSM ingestion:")
 print(tables_before_quackosm.to_string(index=False))
@@ -580,18 +754,36 @@ municipalities = load_municipalities(con)
 print(f"Loaded municipalities: {len(municipalities)}")
 
 # %%
-# Step 3: fetch Puerto Rico geometry and run island-wide QuackOSM extraction.
+# Step 3: fetch Puerto Rico geometry and run island-wide QuackOSM extractions.
 puerto_rico_geometry = resolve_puerto_rico_geometry()
 island_run = run_extraction(
     puerto_rico_geometry,
     DB_PATH,
     CACHE_DIR,
+    tags_filter=QUACKOSM_TAGS_FILTER,
 )
 island_feature_count = count_features_in_table(con, island_run["stage_table"])
 island_run["feature_count"] = island_feature_count
+
+solar_plant_run = run_extraction(
+    puerto_rico_geometry,
+    DB_PATH,
+    CACHE_DIR,
+    tags_filter=SOLAR_PLANT_TAGS_FILTER,
+    stage_table_name=SOLAR_PLANT_STAGE_TABLE_NAME,
+)
+solar_plant_feature_count = count_features_in_table(con, solar_plant_run["stage_table"])
+solar_plant_run["feature_count"] = solar_plant_feature_count
+
+enrich_stage_metadata_from_local_pbf(con, island_run["stage_table"], OSM_PBF_PATH)
+enrich_stage_metadata_from_local_pbf(con, solar_plant_run["stage_table"], OSM_PBF_PATH)
+
 print(f"Island-wide staging table: {island_run['stage_table']}")
 print(f"Island-wide feature count before SQL cleaning (QuackOSM stage rows already prefiltered by tags_filter): {island_feature_count}")
 print(f"Island-wide extraction elapsed: {island_run['elapsed_seconds']}s")
+print(f"Solar-plant staging table: {solar_plant_run['stage_table']}")
+print(f"Solar-plant feature count (plant:method=photovoltaic OR plant:source=solar): {solar_plant_feature_count}")
+print(f"Solar-plant extraction elapsed: {solar_plant_run['elapsed_seconds']}s")
 tables_after_quackosm = list_db_tables(con)
 print("\nTables available after QuackOSM ingestion:")
 print(tables_after_quackosm.to_string(index=False))
@@ -599,7 +791,24 @@ print("\nStage table schema preview:")
 print(preview_table_schema(con, island_run["stage_table"]).to_string(index=False))
 print("\nStage table sample rows:")
 print(preview_table_rows(con, island_run["stage_table"], limit=5).to_string(index=False))
+print("\nSolar-plant stage schema preview:")
+print(preview_table_schema(con, solar_plant_run["stage_table"]).to_string(index=False))
+print("\nSolar-plant stage sample rows:")
+print(preview_table_rows(con, solar_plant_run["stage_table"], limit=5).to_string(index=False))
 
+stage_metadata_cols = {"user", "timestamp"}
+available_stage_cols = set(preview_table_schema(con, island_run["stage_table"])["column_name"].tolist())
+print(f"\nMetadata column check in rooftop stage table -> user/timestamp present: {stage_metadata_cols.issubset(available_stage_cols)}")
+metadata_counts = con.execute(
+    f"""
+    SELECT
+        SUM(CASE WHEN "user" IS NOT NULL THEN 1 ELSE 0 END) AS user_non_null,
+        SUM(CASE WHEN "timestamp" IS NOT NULL THEN 1 ELSE 0 END) AS timestamp_non_null
+    FROM {island_run['stage_table']}
+    """
+).fetchdf()
+print("Rooftop stage metadata non-null counts:")
+print(metadata_counts.to_string(index=False))
 
 # %%
 # Step 4: clean + persist PV geometries in DuckDB and update has_PV indicators.
