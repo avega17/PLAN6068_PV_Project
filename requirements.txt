@@ -4,8 +4,7 @@
 # Core scientific computing
 numpy
 pandas
-scipy
-pyarrow
+# scipy
 
 # Geospatial vector stack
 geopandas
@@ -13,22 +12,22 @@ shapely
 pyproj
 fiona
 pyogrio
-rtree
 
 # Openstreetmap, Overpass API, and PBF files
 osmnx
 quackosm==0.17.0
-overpy
 osmium
 
 # Overture Maps
 overturemaps
-overturemaestro
+overturemaestro==0.5.0
 
 # Raster and multidimensional analysis
 rasterio
 rioxarray
 xarray
+titiler.application
+rasteret==0.3.5
 
 # Data engineering and local analytics
 # Includes DuckDB spatial extension support via SQL INSTALL/LOAD spatial
@@ -36,22 +35,31 @@ duckdb<=1.4.4
 duckdb-engine
 
 # Computer vision and segmentation
-scikit-image
-opencv-python
+# scikit-image
+# opencv-python
 scikit-learn
 
 # Geospatial data/API access
 requests
-pystac-client
-planetary-computer
+aiohttp
+aiofiles
 earthengine-api
 censusdis
+# STAC-specific
+pystac
+pystac-client
+stac-geoparquet
+# rustac==0.9.6
+rustac[arrow]==0.9.6
+planetary-computer
+
 
 # Notebook and Jupytext development workflow
 jupyterlab
 ipykernel
 ipywidgets
 jupytext
+nest_asyncio
 
 # Visualization and mapping
 matplotlib
@@ -59,6 +67,9 @@ seaborn
 plotly
 folium
 lonboard
+async-geotiff
+obstore
+pillow
 contextily
 
 # Utilities

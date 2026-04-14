@@ -1,6 +1,7 @@
 .env
 notebooks/**/cache
 data/**/cache/*
+data/**/*.parquet
 cache/*
 outputs/geoparquet/*
 **/overture_bounding_boxes/

@@ -3,7 +3,7 @@
 ## **1\. Environment & Dependency Management**
 
 * **Tooling:** We use uv as our package manager, but strictly utilizing venv and pip rather than a pyproject.toml or uv directly for project management.  
-* **Environment Setup:** uv venv \--python 3.12 && uv pip install \-r requirements.txt
+* **Existing Environment Setup via:** uv venv \--python 3.12 && uv pip install \-r requirements.txt; access via .\venv\Scripts\activate.bat on Windows or source .venv/bin/activate on Unix.
 
 ## **2\. Notebook Iteration & Version Control**
 
