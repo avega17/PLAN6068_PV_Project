@@ -4,6 +4,7 @@
 # Core scientific computing
 numpy
 pandas
+openpyxl
 # scipy
 
 # Geospatial vector stack
@@ -38,6 +39,7 @@ duckdb-engine
 # scikit-image
 # opencv-python
 scikit-learn
+geoai-py
 
 # Geospatial data/API access
 requests

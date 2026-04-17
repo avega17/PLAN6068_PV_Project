@@ -4,6 +4,8 @@ data/**/cache/*
 data/**/*.parquet
 cache/*
 outputs/geoparquet/*
+outputs/figures/review
+outputs/figures/*.svg
 **/overture_bounding_boxes/
 
 **/*.cpython-*
