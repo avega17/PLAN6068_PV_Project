@@ -71,6 +71,11 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 OUTPUT_CRS = "EPSG:4326"
 TARGET_MUNICIPALITY = "San Juan"
+# Municipalities that must be ingested regardless of top-K PV-label ranking.
+# San Juan is already the top-ranked by OSM PV labels; Isabela is a second
+# project target (Barrio Mora) that sits outside the default top-10 and is
+# force-included here so the Solar API tile pipeline has full coverage.
+FORCE_INCLUDE_MUNICIPALITIES: list[str] = ["San Juan", "Isabela"]
 TARGET_NEIGHBORHOOD_QUERY: str | None = None
 OVERTURE_THEME = "buildings"
 OVERTURE_TYPE = "building"
@@ -311,8 +316,15 @@ def rank_municipalities_by_pv_labels(
 def select_top_k_municipalities(
     ranked_municipalities: gpd.GeoDataFrame,
     top_k: int = TOP_K_MUNICIPALITIES,
+    force_include: list[str] | None = None,
 ) -> gpd.GeoDataFrame:
-    """Pick top-K municipalities with PV evidence; fallback to ranked order when needed."""
+    """Pick top-K municipalities with PV evidence; fallback to ranked order when needed.
+
+    Any municipality names passed via ``force_include`` are always appended to
+    the selection even when they fall outside the natural top-K. This is used
+    to guarantee Solar-API-relevant municipalities (e.g. Isabela) are ingested
+    regardless of their OSM-PV-label rank.
+    """
 
     if top_k < 1:
         raise ValueError("top_k must be at least 1.")
@@ -320,6 +332,19 @@ def select_top_k_municipalities(
     with_labels = ranked_municipalities[ranked_municipalities["pv_labels"] > 0]
     candidates = with_labels if not with_labels.empty else ranked_municipalities
     selected = candidates.head(top_k).copy().reset_index(drop=True)
+
+    if force_include:
+        forced_names = {str(name).casefold() for name in force_include}
+        already_selected = {str(name).casefold() for name in selected["municipality_name"].astype(str)}
+        missing = forced_names - already_selected
+        if missing:
+            extras = ranked_municipalities[
+                ranked_municipalities["municipality_name"].astype(str).str.casefold().isin(missing)
+            ].copy()
+            if not extras.empty:
+                selected = pd.concat([selected, extras], ignore_index=True)
+                selected = selected.drop_duplicates(subset=["municipality_geoid"]).reset_index(drop=True)
+
     if selected.empty:
         raise ValueError("No municipalities are available for top-K selection.")
     return selected
@@ -1236,7 +1261,11 @@ if __name__ == "__main__":
     pv_counts_df, pv_source = fetch_municipality_pv_counts(con)
 
     ranked_municipalities = rank_municipalities_by_pv_labels(municipalities_gdf, pv_counts_df)
-    top_k_municipalities = select_top_k_municipalities(ranked_municipalities, top_k=TOP_K_MUNICIPALITIES)
+    top_k_municipalities = select_top_k_municipalities(
+        ranked_municipalities,
+        top_k=TOP_K_MUNICIPALITIES,
+        force_include=FORCE_INCLUDE_MUNICIPALITIES,
+    )
     top_k_union_geometry = build_union_geometry(top_k_municipalities)
 
     print(f"PV label source used for ranking: {pv_source}")

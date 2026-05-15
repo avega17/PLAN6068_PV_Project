@@ -47,6 +47,8 @@ aiohttp
 aiofiles
 earthengine-api
 censusdis
+google-maps-solar
+
 # STAC-specific
 pystac
 pystac-client
@@ -73,6 +75,10 @@ async-geotiff
 obstore
 pillow
 contextily
+mapclassify
+rasterstats
+libpysal
+esda
 
 # Utilities
 python-dotenv

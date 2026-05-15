@@ -2,10 +2,12 @@
 notebooks/**/cache
 data/**/cache/*
 data/**/*.parquet
+data/rasters/*
 cache/*
 outputs/geoparquet/*
 outputs/figures/review
 outputs/figures/*.svg
+output/geoai_train/*
 **/overture_bounding_boxes/
 
 **/*.cpython-*

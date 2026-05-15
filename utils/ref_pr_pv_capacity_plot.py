@@ -19,7 +19,7 @@ DEFAULT_SHEET_NAME = "Monthly "
 DEFAULT_QUARTER_START = "2017-01-01"
 DEFAULT_QUARTER_END = "2025-12-31"
 
-HEADER_PERIOD_CANDIDATES = (("mes", "ano"), ("periodo",))
+HEADER_PERIOD_CANDIDATES = (("mes", "año"), ("periodo",))
 CAPACITY_COLUMN_CANDIDATES = (
     (("capacidad", "clientes", "gd", "registrados"), ("promedio", "cliente")),
     (("capacidad", "registrados"), ("promedio", "cliente")),
