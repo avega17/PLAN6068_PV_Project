@@ -19,6 +19,8 @@ import duckdb
 import geopandas as gpd
 import osmnx as ox
 import pandas as pd
+import planetary_computer
+import pystac_client
 import rustac
 from dotenv import load_dotenv
 from shapely import from_wkb
@@ -64,6 +66,13 @@ MAXAR_PUBLIC_PARQUET_URI = os.getenv(
     "MAXAR_PUBLIC_PARQUET_URI",
     "https://data.source.coop/maxar/maxar-opendata/maxar-opendata.parquet",
 )
+PLANETARY_COMPUTER_STAC_API_URL = os.getenv(
+    "PLANETARY_COMPUTER_STAC_API_URL",
+    "https://planetarycomputer.microsoft.com/api/stac/v1",
+)
+PLANETARY_COMPUTER_NAIP_COLLECTION = os.getenv("PLANETARY_COMPUTER_NAIP_COLLECTION", "naip")
+PR_NAIP_DATETIME_RANGE = os.getenv("PR_NAIP_DATETIME_RANGE", "2021-01-01/2024-12-31")
+PR_NAIP_SOURCE_NAME = os.getenv("PR_NAIP_SOURCE_NAME", "pr_naip")
 EARTHVIEW_S3_REGION = os.getenv("EARTHVIEW_S3_REGION", "us-west-2")
 
 NORMALIZED_INDEX_COLUMNS = [
@@ -659,11 +668,7 @@ def resolve_vector_db_path() -> Path:
             return PROJECT_ROOT / "data" / "vectors" / db_path
         return db_path
 
-    preferred = PROJECT_ROOT / "data" / "vectors" / "pv_database.db"
-    if preferred.exists():
-        return preferred
-
-    return PROJECT_ROOT / "data" / "vectors" / "PR_vector_data.duckdb"
+    return PROJECT_ROOT / "data" / "PR_PV_plan_data.duckdb"
 
 
 def create_duckdb_connection(
@@ -718,11 +723,11 @@ def load_puerto_rico_boundary() -> BoundaryContext:
         con: duckdb.DuckDBPyConnection | None = None
         try:
             con = create_duckdb_connection(db_path=db_path, read_only=True)
-            if duckdb_table_exists(con, "pr_municipalities"):
+            if duckdb_table_exists(con, "pr_census_counties"):
                 row = con.execute(
                     """
                     SELECT ST_AsWKB(ST_Union_Agg(geometry)) AS geometry_wkb
-                    FROM pr_municipalities
+                    FROM pr_census_counties
                     WHERE geometry IS NOT NULL;
                     """
                 ).fetchone()
@@ -1370,22 +1375,46 @@ def _write_item_records_to_ndjson(item_records: Sequence[Mapping[str, Any]], out
             handle.write(json.dumps(item_record, separators=(",", ":"), default=_json_default) + "\n")
 
 
-async def index_remote_geoparquet_source(config: SourceConfig, boundary: BoundaryContext) -> SourceRunSummary:
-    """Subset the public Earthview GeoParquet mirror to a Puerto Rico STAC file."""
+def _deduplicate_stac_item_records(item_records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate item records, preferring later records for the same collection/id pair."""
 
-    if config.remote_parquet_url is None:
-        raise ValueError("remote_parquet_url is required for remote GeoParquet indexing.")
+    deduped: dict[tuple[str, str], dict[str, Any]] = {}
+    for item_record in item_records:
+        item_id = _clean_string(item_record.get("id"))
+        collection_id = _clean_string(item_record.get("collection"))
+        if item_id is None:
+            continue
+        deduped[(collection_id or "", item_id)] = dict(item_record)
 
-    log = logging.getLogger(f"raster_stac.{config.source_name}")
+    return sorted(
+        deduped.values(),
+        key=lambda item: (
+            _clean_string(item.get("datetime"))
+            or _clean_string(_coerce_mapping(item.get("properties")).get("datetime"))
+            or _clean_string(_coerce_mapping(item.get("properties")).get("start_datetime"))
+            or "",
+            _clean_string(item.get("collection")) or "",
+            _clean_string(item.get("id")) or "",
+        ),
+        reverse=True,
+    )
+
+
+async def _materialize_item_records_source(
+    config: SourceConfig,
+    boundary: BoundaryContext,
+    item_records: Sequence[Mapping[str, Any]],
+    empty_note: str,
+    notes_suffix: str | None = None,
+) -> SourceRunSummary:
+    """Write item records to STAC GeoParquet plus the normalized index output."""
+
     stac_path = config.artifacts.stac_path
     index_path = config.artifacts.index_path
     work_dir = make_work_dir(stac_path)
     ndjson_path = work_dir / TEMP_NDJSON_FILENAME
 
     try:
-        started_at = time.perf_counter()
-        row_records = _query_remote_earthview_rows(config.remote_parquet_url, boundary)
-        item_records = [_serialize_remote_row_to_item(row) for row in row_records]
         item_count = len(item_records)
 
         if stac_path.exists():
@@ -1399,7 +1428,7 @@ async def index_remote_geoparquet_source(config: SourceConfig, boundary: Boundar
                 item_count=0,
                 stac_path=None,
                 index_path=index_path.as_posix(),
-                notes="Remote Earthview parquet returned no Puerto Rico-intersecting items.",
+                notes=empty_note,
             )
 
         _write_item_records_to_ndjson(item_records, ndjson_path)
@@ -1411,8 +1440,10 @@ async def index_remote_geoparquet_source(config: SourceConfig, boundary: Boundar
             source_name=config.source_name,
             strategy=config.strategy,
         )
-        elapsed_seconds = time.perf_counter() - started_at
         file_size_mb = stac_path.stat().st_size / (1024 * 1024)
+        notes = f"normalized_rows={normalized_rows}"
+        if notes_suffix:
+            notes = f"{notes}; {notes_suffix}"
         return SourceRunSummary(
             source_name=config.source_name,
             strategy=config.strategy,
@@ -1424,12 +1455,105 @@ async def index_remote_geoparquet_source(config: SourceConfig, boundary: Boundar
             preview_intersects_count=preview["intersects_preview_count"],
             preview_arrow_rows=preview["arrow_preview_rows"],
             sample_item_ids=preview["sample_item_ids"],
-            notes=f"normalized_rows={normalized_rows}; elapsed_seconds={elapsed_seconds:.1f}",
+            notes=notes,
         )
     finally:
         ndjson_path.unlink(missing_ok=True)
         if work_dir.exists():
             shutil.rmtree(work_dir, ignore_errors=True)
+
+
+async def index_remote_geoparquet_source(config: SourceConfig, boundary: BoundaryContext) -> SourceRunSummary:
+    """Subset the public Earthview GeoParquet mirror to a Puerto Rico STAC file."""
+
+    if config.remote_parquet_url is None:
+        raise ValueError("remote_parquet_url is required for remote GeoParquet indexing.")
+
+    started_at = time.perf_counter()
+    row_records = _query_remote_earthview_rows(config.remote_parquet_url, boundary)
+    item_records = [_serialize_remote_row_to_item(row) for row in row_records]
+    elapsed_seconds = time.perf_counter() - started_at
+
+    return await _materialize_item_records_source(
+        config=config,
+        boundary=boundary,
+        item_records=item_records,
+        empty_note="Remote Earthview parquet returned no Puerto Rico-intersecting items.",
+        notes_suffix=f"elapsed_seconds={elapsed_seconds:.1f}",
+    )
+
+
+def _fetch_planetary_computer_naip_items(
+    boundary: BoundaryContext,
+    stac_api_url: str = PLANETARY_COMPUTER_STAC_API_URL,
+    collection_id: str = PLANETARY_COMPUTER_NAIP_COLLECTION,
+    datetime_range: str = PR_NAIP_DATETIME_RANGE,
+) -> list[dict[str, Any]]:
+    """Fetch Puerto Rico NAIP items from the Planetary Computer STAC API."""
+
+    client = pystac_client.Client.open(
+        stac_api_url,
+        modifier=planetary_computer.sign_inplace,
+    )
+    search = client.search(
+        collections=[collection_id],
+        bbox=list(boundary.bounds),
+        datetime=datetime_range,
+    )
+
+    item_records: list[dict[str, Any]] = []
+    for item in search.items():
+        item_record = item.to_dict(transform_hrefs=False)
+        if item_intersects_boundary(item_record, boundary):
+            item_records.append(item_record)
+    return item_records
+
+
+async def index_unified_naip_source(
+    config: SourceConfig,
+    boundary: BoundaryContext,
+    coastal_catalog_url: str,
+    planetary_computer_stac_api_url: str = PLANETARY_COMPUTER_STAC_API_URL,
+    planetary_computer_collection_id: str = PLANETARY_COMPUTER_NAIP_COLLECTION,
+    datetime_range: str = PR_NAIP_DATETIME_RANGE,
+) -> SourceRunSummary:
+    """Build a Puerto Rico NAIP STAC GeoParquet from coastal and Planetary Computer items."""
+
+    if not coastal_catalog_url:
+        raise ValueError("coastal_catalog_url is required for unified NAIP indexing.")
+
+    log = logging.getLogger(f"raster_stac.{config.source_name}")
+    started_at = time.perf_counter()
+    coastal_items = await _collect_catalog_items_for_boundary(
+        catalog_url=coastal_catalog_url,
+        boundary=boundary,
+        follow_child_links=False,
+        prune_catalogs_by_extent=False,
+        filter_items_by_geometry=True,
+        source_tag=f"{config.source_name}_coastal",
+        log=log,
+    )
+    planetary_computer_items = await asyncio.to_thread(
+        _fetch_planetary_computer_naip_items,
+        boundary,
+        planetary_computer_stac_api_url,
+        planetary_computer_collection_id,
+        datetime_range,
+    )
+    item_records = _deduplicate_stac_item_records([*coastal_items, *planetary_computer_items])
+    elapsed_seconds = time.perf_counter() - started_at
+
+    return await _materialize_item_records_source(
+        config=config,
+        boundary=boundary,
+        item_records=item_records,
+        empty_note="Unified Puerto Rico NAIP sources returned no intersecting items.",
+        notes_suffix=(
+            f"coastal_items={len(coastal_items)}; "
+            f"planetary_computer_items={len(planetary_computer_items)}; "
+            f"elapsed_seconds={elapsed_seconds:.1f}"
+        ),
+    )
 
 
 def build_combined_index(index_paths: Sequence[Path], output_path: Path) -> Path:
@@ -1665,9 +1789,12 @@ def _query_remote_parquet_rows(
 async def materialize_consolidated_pr_raster_catalog(
     output_path: Path,
     boundary: BoundaryContext,
-    naip_catalog_url: str,
+    naip_coastal_catalog_url: str,
     maxar_remote_parquet_url: str = MAXAR_PUBLIC_PARQUET_URI,
     earthview_remote_parquet_url: str = EARTHVIEW_PUBLIC_PARQUET_URI,
+    planetary_computer_stac_api_url: str = PLANETARY_COMPUTER_STAC_API_URL,
+    planetary_computer_naip_collection: str = PLANETARY_COMPUTER_NAIP_COLLECTION,
+    naip_datetime_range: str = PR_NAIP_DATETIME_RANGE,
 ) -> pd.DataFrame:
     """Materialize one Puerto Rico AOI-filtered consolidated GeoParquet across all sources."""
 
@@ -1678,33 +1805,60 @@ async def materialize_consolidated_pr_raster_catalog(
     consolidated_rows: list[dict[str, Any]] = []
     source_summaries: list[dict[str, Any]] = []
 
-    naip_items = await _collect_catalog_items_for_boundary(
-        catalog_url=naip_catalog_url,
-        boundary=boundary,
-        follow_child_links=False,
-        prune_catalogs_by_extent=False,
-        filter_items_by_geometry=True,
-        source_tag="naip_2021_pr",
-        log=log,
+    naip_artifacts = SourceArtifacts(
+        stac_path=output_path.parent / f"{PR_NAIP_SOURCE_NAME}_items.parquet",
+        index_path=output_path.parent / f"{PR_NAIP_SOURCE_NAME}_index.parquet",
     )
-    naip_rows = [
-        row
-        for row in (
-            _to_consolidated_catalog_row(item, source_name="naip_2021_pr", boundary=boundary)
-            for item in naip_items
+    naip_config = SourceConfig(
+        source_name=PR_NAIP_SOURCE_NAME,
+        strategy="hybrid_stac_geoparquet",
+        artifacts=naip_artifacts,
+    )
+    try:
+        naip_summary = await index_unified_naip_source(
+            config=naip_config,
+            boundary=boundary,
+            coastal_catalog_url=naip_coastal_catalog_url,
+            planetary_computer_stac_api_url=planetary_computer_stac_api_url,
+            planetary_computer_collection_id=planetary_computer_naip_collection,
+            datetime_range=naip_datetime_range,
         )
-        if row is not None
-    ]
-    consolidated_rows.extend(naip_rows)
-    source_summaries.append(
-        {
-            "source": "naip_2021_pr",
-            "strategy": "static_catalog_json",
-            "catalog_reference": naip_catalog_url,
-            "item_rows": len(naip_rows),
-            "notes": None,
-        }
-    )
+        naip_rows = []
+        if naip_summary.stac_path is not None:
+            naip_items = _query_remote_parquet_rows(
+                remote_uri=naip_summary.stac_path,
+                boundary=boundary,
+                context="local PR NAIP STAC GeoParquet",
+            )
+            naip_rows = [
+                row
+                for row in (
+                    _to_consolidated_catalog_row(item, source_name=PR_NAIP_SOURCE_NAME, boundary=boundary)
+                    for item in naip_items
+                )
+                if row is not None
+            ]
+            consolidated_rows.extend(naip_rows)
+
+        source_summaries.append(
+            {
+                "source": PR_NAIP_SOURCE_NAME,
+                "strategy": naip_summary.strategy,
+                "catalog_reference": naip_summary.stac_path or naip_artifacts.stac_path.as_posix(),
+                "item_rows": len(naip_rows),
+                "notes": naip_summary.notes,
+            }
+        )
+    except Exception as exc:
+        source_summaries.append(
+            {
+                "source": PR_NAIP_SOURCE_NAME,
+                "strategy": "hybrid_stac_geoparquet",
+                "catalog_reference": naip_artifacts.stac_path.as_posix(),
+                "item_rows": 0,
+                "notes": f"{type(exc).__name__}: {exc}",
+            }
+        )
 
     for source_name, remote_uri, context_label in (
         ("maxar_open_data", maxar_remote_parquet_url, "remote Maxar parquet"),

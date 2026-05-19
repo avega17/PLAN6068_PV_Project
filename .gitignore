@@ -7,7 +7,10 @@ cache/*
 outputs/geoparquet/*
 outputs/figures/review
 outputs/figures/*.svg
-output/geoai_train/*
+outputs/geoai_*/*
+# still WIP and way too large
+outputs/maps/pr_urban_all_geographies_preview.html
+outputs/models/*
 **/overture_bounding_boxes/
 
 **/*.cpython-*

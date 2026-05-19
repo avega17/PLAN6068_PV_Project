@@ -39,7 +39,7 @@ The original RQ1 — replicating the Stid et al. (2025) panel-row superpixel met
 
 ### **3\. Methodology and AI Tool(s)**
 
-The pipeline is implemented as Jupytext `.py` notebooks (paired with `.ipynb`) in five phases. All ingest steps use DuckDB + the spatial extension, and all tiles/polygons flow through the centralized `data/vectors/PR_vector_data.duckdb` database.
+The pipeline is implemented as Jupytext `.py` notebooks (paired with `.ipynb`) in five phases. All ingest steps use DuckDB + the spatial extension, and all tiles/polygons flow through the centralized `data/PR_PV_plan_data.duckdb` database.
 
 #### **3.1 Pipeline Overview**
 

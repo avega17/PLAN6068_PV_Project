@@ -16,12 +16,13 @@ pyogrio
 
 # Openstreetmap, Overpass API, and PBF files
 osmnx
-quackosm==0.17.0
+quackosm==0.17.1
 osmium
 
 # Overture Maps
 overturemaps
-overturemaestro==0.5.0
+# overturemaestro==0.5.0
+overturemaestro==0.6.1
 
 # Raster and multidimensional analysis
 rasterio
@@ -32,7 +33,8 @@ rasteret==0.3.5
 
 # Data engineering and local analytics
 # Includes DuckDB spatial extension support via SQL INSTALL/LOAD spatial
-duckdb<=1.4.4
+# duckdb<=1.4.4
+duckdb~=1.5.2
 duckdb-engine
 
 # Computer vision and segmentation
@@ -40,6 +42,7 @@ duckdb-engine
 # opencv-python
 scikit-learn
 geoai-py
+# torch>=2.12
 
 # Geospatial data/API access
 requests
@@ -52,7 +55,7 @@ google-maps-solar
 # STAC-specific
 pystac
 pystac-client
-stac-geoparquet
+stac-geoparquet==0.7.0
 # rustac==0.9.6
 rustac[arrow]==0.9.6
 planetary-computer

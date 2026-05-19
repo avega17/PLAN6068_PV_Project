@@ -1,12 +1,13 @@
 # %% [markdown]
-# # Puerto Rico Overture Buildings Ingestion (Draft: San Juan)
+# # Puerto Rico Overture Buildings Ingestion (Island-Wide)
 # 
-# This notebook/script ingests Overture building footprints for one municipality
-# (San Juan) as an initial draft. It follows a progressive, step-wise workflow:
+# This notebook/script ingests Overture building footprints for Puerto Rico as
+# an island-wide cacheable artifact, then persists the cleaned result into the
+# project DuckDB. It follows a progressive, step-wise workflow:
 # 
 # 1. Connect to local DuckDB and extract municipality boundaries.
 # 2. Rank municipalities using available PV label evidence.
-# 3. Fetch Overture building footprints with `overturemaestro`.
+# 3. Build or reuse a whole-island Overture GeoParquet cache.
 # 4. Keep only analysis-critical columns and load to DuckDB.
 # 5. Build a spatially optimized table with Hilbert ordering + RTree index.
 # 6. Preview a municipality subset in lonboard with optional neighborhood clip.
@@ -15,12 +16,13 @@
 """03_overture_buildings_ingest.py
 
 Jupytext-friendly workflow for ingesting Overture Maps building footprints into
-the local Puerto Rico vector DuckDB database.
+the local Puerto Rico DuckDB database.
 
-Initial draft scope:
-- Single municipality geometry filter (target: San Juan)
-- Column-pruned schema for performant downstream joins
-- Native DuckDB GEOMETRY storage and spatial indexing
+Default scope:
+- whole-island building fetch via the official overturemaps client
+- persisted GeoParquet cache reused across reruns
+- column-pruned schema for performant downstream joins
+- native DuckDB GEOMETRY storage and spatial indexing
 """
 
 # %%
@@ -67,10 +69,13 @@ PROJECT_ROOT = resolve_project_root()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from utils.overture import occupied_h3_cells_sql
+
 load_dotenv(PROJECT_ROOT / ".env")
 
 OUTPUT_CRS = "EPSG:4326"
 TARGET_MUNICIPALITY = "San Juan"
+DEFAULT_VECTOR_DB_PATH = PROJECT_ROOT / "data" / "PR_PV_plan_data.duckdb"
 # Municipalities that must be ingested regardless of top-K PV-label ranking.
 # San Juan is already the top-ranked by OSM PV labels; Isabela is a second
 # project target (Barrio Mora) that sits outside the default top-10 and is
@@ -80,7 +85,10 @@ TARGET_NEIGHBORHOOD_QUERY: str | None = None
 OVERTURE_THEME = "buildings"
 OVERTURE_TYPE = "building"
 OVERTURE_TABLE = "pr_overture_buildings"
-OVERTURE_WORKING_DIR = PROJECT_ROOT / "data" / "vectors" / "cache"
+OVERTURE_WORKING_DIR = PROJECT_ROOT / "cache" / "overture_tmp"
+OVERTURE_FETCH_BACKEND = os.getenv("OVERTURE_FETCH_BACKEND", "official_island_bbox").strip().lower()
+OVERTURE_REFRESH_GEOPARQUET_CACHE = os.getenv("OVERTURE_REFRESH_GEOPARQUET_CACHE", "0") == "1"
+CLEAN_LEGACY_OVERTURE_ARTIFACTS = os.getenv("CLEAN_LEGACY_OVERTURE_ARTIFACTS", "1") == "1"
 TOP_K_MUNICIPALITIES = 10
 OVERTURE_FETCH_STRATEGY = "single_union"
 OVERTURE_DOWNLOAD_MAX_WORKERS: int | None = 8
@@ -89,23 +97,10 @@ ENABLE_3D_PREVIEW = True
 HEIGHT_FROM_FLOOR_METERS = 3.2
 MIN_PREVIEW_ELEVATION_METERS = 1.0
 OVERTURE_RELEASE = os.getenv("OVERTURE_RELEASE", "2026-03-18.0")
-OVERTURE_REMOTE_BUILDINGS_URI = (
-    f"s3://overturemaps-us-west-2/release/{OVERTURE_RELEASE}/theme=buildings/type=building/*.parquet"
-)
-# Island-wide prefilter window used only for remote parquet pruning before ST_Intersects.
-PUERTO_RICO_PREFILTER_BBOX = (-67.35, 17.85, -65.15, 18.55)
-DIRECT_VALIDATION_MUNICIPALITIES = [
-    "San Juan",
-    "Ponce",
-    "Caguas",
-    "Bayamón",
-    "Carolina",
-    "Mayagüez",
-]
-RUN_DIRECT_REMOTE_VALIDATION = True
-RUN_ISLAND_BBOX_OFFICIAL_EXPORT = False
+H3_RESOLUTION = int(os.getenv("OVERTURE_BUILDING_H3_RESOLUTION", "10"))
+RUN_ISLAND_BBOX_OFFICIAL_EXPORT = True
 ISLAND_BBOX_EXPORT_FILENAME = f"pr_overture_buildings_island_bbox_{OVERTURE_RELEASE}.parquet"
-ISLAND_BBOX_EXPORT_DIR = PROJECT_ROOT / "outputs" / "geoparquet"
+ISLAND_BBOX_EXPORT_DIR = PROJECT_ROOT / "data" / "vectors" / "cache"
 ISLAND_BBOX_EXPORT_COMPRESSION = "zstd"
 
 CRITICAL_BUILDING_COLUMNS = [
@@ -138,13 +133,7 @@ def format_size_bytes(size_bytes: int) -> str:
 
 
 def resolve_db_path() -> Path:
-    """Resolve local DuckDB path with env override and resilient fallback.
-
-    Priority order:
-    1) VECTOR_DB from .env
-    2) data/vectors/pv_database.db (requested path for this feature)
-    3) data/vectors/pr_vector_data.duckdb (existing repository convention)
-    """
+    """Resolve the project DuckDB path with env override and stable default."""
 
     db_path_value = os.getenv("VECTOR_DB")
     if db_path_value:
@@ -153,12 +142,7 @@ def resolve_db_path() -> Path:
             db_path = PROJECT_ROOT / db_path if len(db_path.parts) > 1 else PROJECT_ROOT / "data" / "vectors" / db_path
         return db_path
 
-    preferred = PROJECT_ROOT / "data" / "vectors" / "pv_database.db"
-    if preferred.exists():
-        return preferred
-
-    fallback = PROJECT_ROOT / "data" / "vectors" / "pr_vector_data.duckdb"
-    return fallback
+    return DEFAULT_VECTOR_DB_PATH
 
 
 def create_spatial_connection(db_path: Path) -> duckdb.DuckDBPyConnection:
@@ -174,7 +158,20 @@ def create_spatial_connection(db_path: Path) -> duckdb.DuckDBPyConnection:
     except duckdb.Error:
         # Parquet is bundled in many DuckDB builds.
         pass
+    load_h3_extension(con)
     return con
+
+
+def load_h3_extension(con: duckdb.DuckDBPyConnection) -> bool:
+    """Load DuckDB's community H3 extension when available."""
+
+    try:
+        con.execute("INSTALL h3 FROM community;")
+        con.execute("LOAD h3;")
+        return True
+    except duckdb.Error as exc:
+        print(f"[warn] DuckDB h3 extension unavailable: {exc}")
+        return False
 
 
 def table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
@@ -203,6 +200,32 @@ def _to_bytes(value: object) -> bytes:
     return bytes(value)
 
 
+def is_native_duckdb_geometry_type(type_name: object) -> bool:
+    """Return True when DuckDB already exposes a native GEOMETRY column."""
+
+    return isinstance(type_name, str) and type_name.strip().upper().startswith("GEOMETRY")
+
+
+def resolve_geometry_sql_expression(
+    con: duckdb.DuckDBPyConnection,
+    relation_sql: str,
+    geometry_column: str = "geometry",
+) -> str:
+    """Choose passthrough vs WKB deserialization for a relation's geometry column."""
+
+    schema_df = con.execute(
+        f"""
+        DESCRIBE SELECT {geometry_column}
+        FROM {relation_sql}
+        """
+    ).fetchdf()
+    if schema_df.empty or "column_type" not in schema_df.columns:
+        raise RuntimeError(f"Unable to infer geometry type for {relation_sql}.{geometry_column}.")
+
+    geometry_type = schema_df.iloc[0]["column_type"]
+    return geometry_column if is_native_duckdb_geometry_type(geometry_type) else f"ST_GeomFromWKB({geometry_column})"
+
+
 def fetch_municipality_boundaries(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame:
     """Load Puerto Rico municipality polygons from local DuckDB."""
 
@@ -212,7 +235,7 @@ def fetch_municipality_boundaries(con: duckdb.DuckDBPyConnection) -> gpd.GeoData
             GEOID AS municipality_geoid,
             NAME AS municipality_name,
             ST_AsWKB(geometry) AS geometry_wkb
-        FROM pr_municipalities
+        FROM pr_census_counties
         WHERE ST_GeometryType(geometry) IN ('POLYGON', 'MULTIPOLYGON')
         ORDER BY municipality_name;
         """
@@ -248,7 +271,7 @@ def fetch_municipality_pv_counts(con: duckdb.DuckDBPyConnection) -> tuple[pd.Dat
             m.GEOID AS municipality_geoid,
             m.NAME AS municipality_name,
             COUNT(s.feature_id) AS pv_labels
-        FROM pr_municipalities AS m
+        FROM pr_census_counties AS m
         LEFT JOIN pr_osm_quackosm_stage AS s
           ON ST_Intersects(m.geometry, s.geometry)
          AND (
@@ -268,10 +291,10 @@ def fetch_municipality_pv_counts(con: duckdb.DuckDBPyConnection) -> tuple[pd.Dat
         GEOID AS municipality_geoid,
         NAME AS municipality_name,
         CAST(coalesce(has_PV, FALSE) AS INTEGER) AS pv_labels
-    FROM pr_municipalities
+    FROM pr_census_counties
     ORDER BY pv_labels DESC, municipality_name;
     """
-    return con.execute(query).fetchdf(), "pr_municipalities.has_PV"
+    return con.execute(query).fetchdf(), "pr_census_counties.has_PV"
 
 
 def choose_target_municipality(
@@ -357,6 +380,33 @@ def build_union_geometry(municipalities_gdf: gpd.GeoDataFrame) -> BaseGeometry:
     if union_geometry is None or union_geometry.is_empty:
         raise ValueError("Top-K municipality union geometry is empty.")
     return union_geometry
+
+
+def cleanup_legacy_overture_artifacts() -> list[Path]:
+    """Remove legacy Overture sidecar/cache artifacts outside the parquet cache."""
+
+    deleted_paths: list[Path] = []
+    if not CLEAN_LEGACY_OVERTURE_ARTIFACTS:
+        return deleted_paths
+
+    legacy_roots = [
+        PROJECT_ROOT / "data" / "vectors" / "cache",
+        OVERTURE_WORKING_DIR,
+    ]
+    seen: set[Path] = set()
+    for root in legacy_roots:
+        if root in seen or not root.exists():
+            continue
+        seen.add(root)
+        for path in root.iterdir():
+            if "overture" not in path.name.lower():
+                continue
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+            deleted_paths.append(path)
+    return deleted_paths
 
 
 def fetch_overture_buildings(
@@ -604,6 +654,12 @@ def clean_buildings_schema(
 def write_buildings_to_duckdb(con: duckdb.DuckDBPyConnection, gdf: gpd.GeoDataFrame) -> None:
     """Persist cleaned Overture footprints with layout optimizations."""
 
+    if not load_h3_extension(con):
+        raise RuntimeError(
+            "DuckDB h3 extension is required to persist building-level H3 columns. "
+            "Install or enable community extensions, then rerun this notebook."
+        )
+
     stage_df = pd.DataFrame(gdf.drop(columns=["geometry"]).copy())
     stage_df["geometry_wkb"] = gdf.geometry.to_wkb()
 
@@ -614,6 +670,9 @@ def write_buildings_to_duckdb(con: duckdb.DuckDBPyConnection, gdf: gpd.GeoDataFr
     # 2) We materialize DuckDB native GEOMETRY from WKB for spatial SQL support.
     # 3) We sort by ST_Hilbert(geometry) to improve spatial locality and selective
     #    predicate performance for downstream bounding-box and intersection filters.
+    # 4) We keep both an RTREE on geometry and a composite municipality/H3 index
+    #    because downstream notebooks repeatedly derive occupied H3 cells and
+    #    municipality-scoped previews from this base table.
     con.execute(
         f"""
         CREATE OR REPLACE TABLE {OVERTURE_TABLE} AS
@@ -635,6 +694,13 @@ def write_buildings_to_duckdb(con: duckdb.DuckDBPyConnection, gdf: gpd.GeoDataFr
                 ST_GeomFromWKB(geometry_wkb) AS geometry
             FROM staged_overture_buildings
             WHERE geometry_wkb IS NOT NULL
+        ),
+        pointified AS (
+            SELECT
+                *,
+                ST_PointOnSurface(geometry) AS centroid_geometry
+            FROM typed
+            WHERE ST_IsValid(geometry)
         )
         SELECT
             id,
@@ -650,169 +716,39 @@ def write_buildings_to_duckdb(con: duckdb.DuckDBPyConnection, gdf: gpd.GeoDataFr
             roof_orientation,
             roof_height,
             loaded_at_utc,
+            CAST(ST_X(centroid_geometry) AS DOUBLE) AS building_centroid_lon,
+            CAST(ST_Y(centroid_geometry) AS DOUBLE) AS building_centroid_lat,
+            CAST({H3_RESOLUTION} AS INTEGER) AS h3_resolution,
+            CAST(
+                h3_latlng_to_cell(
+                    ST_Y(centroid_geometry),
+                    ST_X(centroid_geometry),
+                    {H3_RESOLUTION}
+                ) AS UBIGINT
+            ) AS h3_cell_uint,
+            CAST(
+                h3_latlng_to_cell_string(
+                    ST_Y(centroid_geometry),
+                    ST_X(centroid_geometry),
+                    {H3_RESOLUTION}
+                ) AS VARCHAR
+            ) AS h3_cell_id,
             geometry
-        FROM typed
-        WHERE ST_IsValid(geometry)
+        FROM pointified
         ORDER BY ST_Hilbert(geometry);
         """
     )
     con.execute(f"DROP INDEX IF EXISTS idx_{OVERTURE_TABLE}_geometry;")
+    con.execute(f"DROP INDEX IF EXISTS idx_{OVERTURE_TABLE}_h3_cell_id;")
+    con.execute(f"DROP INDEX IF EXISTS idx_{OVERTURE_TABLE}_municipality_name_h3_cell_id;")
     con.execute(f"CREATE INDEX idx_{OVERTURE_TABLE}_geometry ON {OVERTURE_TABLE} USING RTREE (geometry);")
+    con.execute(f"CREATE INDEX idx_{OVERTURE_TABLE}_h3_cell_id ON {OVERTURE_TABLE} (h3_cell_id);")
+    con.execute(
+        f"CREATE INDEX idx_{OVERTURE_TABLE}_municipality_name_h3_cell_id "
+        f"ON {OVERTURE_TABLE} (municipality_name, h3_cell_id);"
+    )
     con.execute(f"ANALYZE {OVERTURE_TABLE};")
     con.unregister("staged_overture_buildings")
-
-
-def _sql_quote(value: str) -> str:
-    """Escape a Python string for safe inline SQL literal usage."""
-
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-def validate_local_vs_remote_duckdb_counts(
-    con: duckdb.DuckDBPyConnection,
-    municipality_names: list[str],
-    selected_fetch_municipality_names: set[str] | None = None,
-    local_table_name: str = OVERTURE_TABLE,
-    remote_buildings_uri: str = OVERTURE_REMOTE_BUILDINGS_URI,
-) -> pd.DataFrame:
-    """Compare local ingested counts against direct remote Overture counts via DuckDB.
-
-    The remote query follows Overture's documented pattern:
-    bbox prefilter first, then ST_Intersects against municipality geometry.
-    """
-
-    try:
-        con.execute("INSTALL httpfs;")
-        con.execute("LOAD httpfs;")
-    except duckdb.Error:
-        pass
-    con.execute("SET s3_region='us-west-2';")
-
-    requested_names = [str(name).strip() for name in municipality_names if str(name).strip()]
-    if not requested_names:
-        return pd.DataFrame(
-            columns=[
-                "municipality_name",
-                "in_current_fetch_scope",
-                "local_pr_overture_buildings",
-                "direct_remote_duckdb_count",
-                "difference",
-                "coverage_ratio_local_over_remote",
-            ]
-        )
-
-    requested_values_sql = ", ".join(f"({_sql_quote(name)})" for name in requested_names)
-    remote_uri_sql = _sql_quote(remote_buildings_uri)
-    table_exists_local = table_exists(con, local_table_name)
-    remote_geometry_type_row = con.execute(
-        f"""
-        SELECT typeof(geometry) AS geometry_type
-        FROM read_parquet({remote_uri_sql})
-        LIMIT 1
-        """
-    ).fetchone()
-    if remote_geometry_type_row is None or remote_geometry_type_row[0] is None:
-        raise RuntimeError("Unable to infer geometry type from remote Overture buildings parquet.")
-    remote_geometry_type = str(remote_geometry_type_row[0]).upper()
-    remote_geometry_expr = "geometry" if "GEOMETRY" in remote_geometry_type else "ST_GeomFromWKB(geometry)"
-    island_xmin, island_ymin, island_xmax, island_ymax = PUERTO_RICO_PREFILTER_BBOX
-
-    local_counts_cte = (
-        f"""
-        local_counts AS (
-            SELECT municipality_name, COUNT(*)::BIGINT AS local_count
-            FROM {local_table_name}
-            GROUP BY municipality_name
-        ),
-        """
-        if table_exists_local
-        else """
-        local_counts AS (
-            SELECT municipality_name, 0::BIGINT AS local_count
-            FROM requested
-        ),
-        """
-    )
-
-    comparison_df = con.execute(
-        f"""
-        WITH requested(municipality_name) AS (
-            VALUES {requested_values_sql}
-        ),
-        targets AS (
-            SELECT
-                r.municipality_name,
-                ST_GeomFromWKB(ST_AsWKB(m.geometry)) AS municipality_geometry
-            FROM requested AS r
-            LEFT JOIN pr_municipalities AS m
-                ON m.NAME = r.municipality_name
-        ),
-        {local_counts_cte}
-        remote_candidates AS (
-                        SELECT {remote_geometry_expr} AS building_geometry
-            FROM read_parquet({remote_uri_sql})
-                        WHERE bbox.xmin <= {island_xmax}
-                            AND bbox.xmax >= {island_xmin}
-                            AND bbox.ymin <= {island_ymax}
-                            AND bbox.ymax >= {island_ymin}
-        ),
-        remote_counts AS (
-            SELECT
-                t.municipality_name,
-                COUNT(*)::BIGINT AS remote_count
-            FROM targets AS t
-            JOIN remote_candidates AS c
-                ON t.municipality_geometry IS NOT NULL
-               AND ST_Intersects(t.municipality_geometry, c.building_geometry)
-            GROUP BY t.municipality_name
-        )
-        SELECT
-            t.municipality_name,
-            t.municipality_geometry IS NOT NULL AS has_boundary,
-            COALESCE(l.local_count, 0)::BIGINT AS local_count,
-            COALESCE(r.remote_count, 0)::BIGINT AS remote_count
-        FROM targets AS t
-        LEFT JOIN local_counts AS l USING (municipality_name)
-        LEFT JOIN remote_counts AS r USING (municipality_name)
-        ORDER BY t.municipality_name;
-        """
-    ).fetchdf()
-
-    rows: list[dict[str, object]] = []
-    for _, row in comparison_df.iterrows():
-        municipality_name = str(row["municipality_name"])
-        has_boundary = bool(row["has_boundary"])
-        in_scope = municipality_name in selected_fetch_municipality_names if selected_fetch_municipality_names is not None else None
-
-        if not has_boundary:
-            rows.append(
-                {
-                    "municipality_name": municipality_name,
-                    "in_current_fetch_scope": in_scope,
-                    "local_pr_overture_buildings": None,
-                    "direct_remote_duckdb_count": None,
-                    "difference": None,
-                    "coverage_ratio_local_over_remote": None,
-                }
-            )
-            continue
-
-        local_as_int = int(row["local_count"])
-        remote_as_int = int(row["remote_count"])
-        ratio = (float(local_as_int) / float(remote_as_int)) if remote_as_int > 0 else None
-        rows.append(
-            {
-                "municipality_name": municipality_name,
-                "in_current_fetch_scope": in_scope,
-                "local_pr_overture_buildings": local_as_int,
-                "direct_remote_duckdb_count": remote_as_int,
-                "difference": remote_as_int - local_as_int,
-                "coverage_ratio_local_over_remote": ratio,
-            }
-        )
-
-    result_df = pd.DataFrame(rows)
-    return result_df.sort_values("municipality_name").reset_index(drop=True)
 
 
 def compute_island_bbox_from_municipalities(municipalities_gdf: gpd.GeoDataFrame) -> tuple[float, float, float, float]:
@@ -864,6 +800,7 @@ def export_official_island_bbox_geoparquet_with_sql_assignment(
     fetch_elapsed_seconds = time.perf_counter() - fetch_started
 
     # Persist raw pull to a temporary parquet snapshot for reproducibility/debugging.
+    OVERTURE_WORKING_DIR.mkdir(parents=True, exist_ok=True)
     temp_dir = Path(tempfile.mkdtemp(prefix="official_overture_bbox_", dir=str(OVERTURE_WORKING_DIR)))
     raw_snapshot_path = temp_dir / "official_overture_buildings_raw.parquet"
     pq.write_table(official_table, raw_snapshot_path, compression=compression)
@@ -871,9 +808,10 @@ def export_official_island_bbox_geoparquet_with_sql_assignment(
 
     assignment_started = time.perf_counter()
     con.register("official_overture_bbox_arrow", official_table)
+    official_geometry_expr = resolve_geometry_sql_expression(con, relation_sql="official_overture_bbox_arrow")
 
     con.execute(
-        """
+        f"""
         CREATE OR REPLACE TEMP TABLE official_overture_bbox_buildings AS
         SELECT
             ROW_NUMBER() OVER () AS rid,
@@ -887,7 +825,7 @@ def export_official_island_bbox_geoparquet_with_sql_assignment(
             TRY_CAST(roof_direction AS DOUBLE) AS roof_direction,
             CAST(roof_orientation AS VARCHAR) AS roof_orientation,
             TRY_CAST(roof_height AS DOUBLE) AS roof_height,
-            ST_GeomFromWKB(geometry) AS geometry
+            {official_geometry_expr} AS geometry
         FROM official_overture_bbox_arrow
         WHERE geometry IS NOT NULL;
         """
@@ -908,7 +846,7 @@ def export_official_island_bbox_geoparquet_with_sql_assignment(
                 m.NAME AS municipality_name,
                 ROW_NUMBER() OVER (PARTITION BY b.rid ORDER BY m.NAME) AS rank_in_muni
             FROM buildings AS b
-            LEFT JOIN pr_municipalities AS m
+            LEFT JOIN pr_census_counties AS m
               ON ST_Within(ST_PointOnSurface(b.geometry), m.geometry)
         ),
         intersect_ranked AS (
@@ -921,7 +859,7 @@ def export_official_island_bbox_geoparquet_with_sql_assignment(
                     ORDER BY ST_Area(ST_Intersection(m.geometry, b.geometry)) DESC NULLS LAST, m.NAME
                 ) AS rank_in_muni
             FROM buildings AS b
-            JOIN pr_municipalities AS m
+            JOIN pr_census_counties AS m
               ON ST_Intersects(m.geometry, b.geometry)
         )
         SELECT
@@ -1002,6 +940,73 @@ def export_official_island_bbox_geoparquet_with_sql_assignment(
         "output_size_bytes": int(output_size_bytes),
         "municipality_preview": municipality_preview,
     }
+
+
+def load_overture_cache_geodataframe(cache_path: Path) -> gpd.GeoDataFrame:
+    """Load a persisted island Overture GeoParquet cache as a GeoDataFrame."""
+
+    gdf = gpd.read_parquet(cache_path)
+    if gdf.crs is None:
+        gdf = gdf.set_crs(OUTPUT_CRS)
+    else:
+        gdf = gdf.to_crs(OUTPUT_CRS)
+    return _ensure_overture_id_column(gdf)
+
+
+def summarize_overture_cache(cache_path: Path, gdf: gpd.GeoDataFrame, *, release: str) -> dict[str, object]:
+    """Build summary metadata for a persisted island Overture cache."""
+
+    municipio_counts = (
+        gdf["municipality_name"]
+        .fillna("UNASSIGNED")
+        .value_counts()
+        .rename_axis("municipality_name")
+        .reset_index(name="building_rows")
+    )
+    assigned = int(gdf["municipality_name"].notna().sum()) if "municipality_name" in gdf.columns else 0
+    output_size_bytes = cache_path.stat().st_size if cache_path.exists() else 0
+    return {
+        "release": release,
+        "output_path": str(cache_path),
+        "rows_total": int(len(gdf)),
+        "rows_assigned": assigned,
+        "rows_unassigned": int(len(gdf)) - assigned,
+        "fetch_elapsed_seconds": 0.0,
+        "assignment_elapsed_seconds": 0.0,
+        "total_elapsed_seconds": 0.0,
+        "raw_snapshot_size_bytes": 0,
+        "output_size_bytes": int(output_size_bytes),
+        "municipality_preview": municipio_counts.head(20),
+        "used_cache": True,
+    }
+
+
+def build_or_load_official_island_bbox_geoparquet(
+    con: duckdb.DuckDBPyConnection,
+    municipalities_gdf: gpd.GeoDataFrame,
+    output_path: Path,
+    *,
+    refresh: bool = OVERTURE_REFRESH_GEOPARQUET_CACHE,
+    release: str = OVERTURE_RELEASE,
+    compression: str = ISLAND_BBOX_EXPORT_COMPRESSION,
+) -> tuple[gpd.GeoDataFrame, dict[str, object]]:
+    """Reuse the island Overture cache when available, otherwise rebuild it."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() and not refresh:
+        cached_gdf = load_overture_cache_geodataframe(output_path)
+        return cached_gdf, summarize_overture_cache(output_path, cached_gdf, release=release)
+
+    stats = export_official_island_bbox_geoparquet_with_sql_assignment(
+        con,
+        municipalities_gdf=municipalities_gdf,
+        output_path=output_path,
+        release=release,
+        compression=compression,
+    )
+    stats["used_cache"] = False
+    refreshed_gdf = load_overture_cache_geodataframe(output_path)
+    return refreshed_gdf, stats
 
 
 def load_duckdb_wkb_query_to_gdf(
@@ -1247,12 +1252,14 @@ def render_interactive_municipality_preview(
 # %%
 if __name__ == "__main__":
     db_path = resolve_db_path()
-    OVERTURE_WORKING_DIR.mkdir(parents=True, exist_ok=True)
-    ingest_temp_dir = Path(tempfile.mkdtemp(prefix="overture_ingest_", dir=str(OVERTURE_WORKING_DIR)))
+    cleaned_paths = cleanup_legacy_overture_artifacts()
 
     print(f"Resolved project root: {PROJECT_ROOT}")
     print(f"Using DuckDB path: {db_path}")
-    print(f"Using temporary Overture ingest directory: {ingest_temp_dir}")
+    print(f"Using Overture backend: {OVERTURE_FETCH_BACKEND}")
+    print(f"Using transient Overture temp directory: {OVERTURE_WORKING_DIR}")
+    if cleaned_paths:
+        print(f"Removed {len(cleaned_paths):,} legacy Overture cache artifacts before starting this run.")
 
     con = create_spatial_connection(db_path)
     print("Connected to DuckDB with spatial extension loaded.")
@@ -1266,17 +1273,16 @@ if __name__ == "__main__":
         top_k=TOP_K_MUNICIPALITIES,
         force_include=FORCE_INCLUDE_MUNICIPALITIES,
     )
-    top_k_union_geometry = build_union_geometry(top_k_municipalities)
 
     print(f"PV label source used for ranking: {pv_source}")
     print("Top municipality candidates by PV labels:")
     print(ranked_municipalities[["municipality_geoid", "municipality_name", "pv_labels"]].head(12).to_string(index=False))
-    print(f"\nTop-{len(top_k_municipalities)} municipalities selected for union geometry fetch:")
-    print(top_k_municipalities[["municipality_geoid", "municipality_name", "pv_labels"]].to_string(index=False))
-    print(
-        "\nScope note: current overturemaestro ingest is limited to top-K municipalities. "
-        "Municipalities outside that set may appear only via edge-overlap assignment."
-    )
+    # print(f"\nTop-{len(top_k_municipalities)} municipalities by PV evidence (context for QA + previews):")
+    # print(top_k_municipalities[["municipality_geoid", "municipality_name", "pv_labels"]].to_string(index=False))
+    # print(
+    #     "\nScope note: the default ingest path is now whole-island. The top-K ranking remains useful "
+    #     "for validation focus, preview selection, and later label-driven QA."
+    # )
 
     target_row = choose_target_municipality(municipalities_gdf, pv_counts_df, TARGET_MUNICIPALITY)
     target_geometry = target_row.geometry
@@ -1296,25 +1302,47 @@ if __name__ == "__main__":
     )
 
 # %% [markdown]
-# ## Step 2 - Fetch Overture buildings for top-K municipality union geometry (parquet-first)
+# ## Step 2 - Build or reuse the whole-island Overture GeoParquet cache
 
 # %%
 if __name__ == "__main__":
-    print(
-        f"Fetching Overture buildings with strategy='{OVERTURE_FETCH_STRATEGY}' "
-        f"over top-{len(top_k_municipalities)} municipality union geometry."
-    )
-    print(
-        "Fetch filter note: building footprints are selected by intersection with "
-        "the top-K municipality union geometry. PV labels are used only to rank/select those municipalities."
-    )
-    overture_raw_gdf, overture_parquet_paths = fetch_overture_buildings(
-        top_k_union_geometry,
-        ingest_temp_dir,
-        strategy=OVERTURE_FETCH_STRATEGY,
-        columns_to_download=OVERTURE_COLUMNS_TO_DOWNLOAD,
-        max_workers=OVERTURE_DOWNLOAD_MAX_WORKERS,
-    )
+    island_export_path = ISLAND_BBOX_EXPORT_DIR / ISLAND_BBOX_EXPORT_FILENAME
+    island_cache_stats: dict[str, object] | None = None
+
+    if OVERTURE_FETCH_BACKEND == "official_island_bbox":
+        print(f"Building or reusing the whole-island Overture GeoParquet cache at {island_export_path}.")
+        overture_raw_gdf, island_cache_stats = build_or_load_official_island_bbox_geoparquet(
+            con,
+            municipalities_gdf=municipalities_gdf,
+            output_path=island_export_path,
+            refresh=OVERTURE_REFRESH_GEOPARQUET_CACHE,
+            release=OVERTURE_RELEASE,
+            compression=ISLAND_BBOX_EXPORT_COMPRESSION,
+        )
+        overture_parquet_paths = [island_export_path]
+        print(
+            f"Whole-island cache {'reused' if island_cache_stats['used_cache'] else 'rebuilt'}; "
+            f"rows={int(island_cache_stats['rows_total']):,}."
+        )
+    elif OVERTURE_FETCH_BACKEND == "maestro_geometry":
+        print(
+            f"Fetching Overture buildings with legacy strategy='{OVERTURE_FETCH_STRATEGY}' "
+            f"over top-{len(top_k_municipalities)} municipality union geometry."
+        )
+        OVERTURE_WORKING_DIR.mkdir(parents=True, exist_ok=True)
+        ingest_temp_dir = Path(tempfile.mkdtemp(prefix="overture_ingest_", dir=str(OVERTURE_WORKING_DIR)))
+        top_k_union_geometry = build_union_geometry(top_k_municipalities)
+        overture_raw_gdf, overture_parquet_paths = fetch_overture_buildings(
+            top_k_union_geometry,
+            ingest_temp_dir,
+            strategy=OVERTURE_FETCH_STRATEGY,
+            columns_to_download=OVERTURE_COLUMNS_TO_DOWNLOAD,
+            max_workers=OVERTURE_DOWNLOAD_MAX_WORKERS,
+        )
+    else:
+        raise ValueError(
+            "Unsupported OVERTURE_FETCH_BACKEND. Expected 'official_island_bbox' or 'maestro_geometry'."
+        )
 
     print(f"Fetched Overture rows: {len(overture_raw_gdf):,}")
     print("GeoParquet artifacts:")
@@ -1332,9 +1360,6 @@ if __name__ == "__main__":
     print(f"Raw Overture columns ({len(overture_raw_gdf.columns)}): {list(overture_raw_gdf.columns)}")
     print("Raw Overture preview:")
     print(overture_raw_gdf.head(5).drop(columns=["geometry"], errors="ignore").to_string(index=False))
-
-# %%
-
 
 # %% [markdown]
 # ## Step 3 - Prune/flatten schema for performant local storage
@@ -1360,9 +1385,23 @@ if __name__ == "__main__":
 # %%
 if __name__ == "__main__":
     write_buildings_to_duckdb(con, overture_clean_gdf)
+    con.execute("DROP TABLE IF EXISTS pr_overture_building_h3;")
+    con.execute("DROP TABLE IF EXISTS pr_overture_h3_cells;")
 
     row_count = con.execute(f"SELECT COUNT(*) AS n_rows FROM {OVERTURE_TABLE};").fetchone()[0]
     print(f"Loaded rows in {OVERTURE_TABLE}: {row_count:,}")
+
+    occupied_h3_sql = occupied_h3_cells_sql(OVERTURE_TABLE)
+    h3_building_count = con.execute(
+        f"SELECT COUNT(*) AS n_rows FROM {OVERTURE_TABLE} WHERE h3_cell_id IS NOT NULL;"
+    ).fetchone()[0]
+    h3_cell_count = con.execute(
+        f"WITH occupied_h3 AS ({occupied_h3_sql}) SELECT COUNT(*) AS n_rows FROM occupied_h3;"
+    ).fetchone()[0]
+    print(
+        f"Persisted {h3_building_count:,} building rows with embedded H3 assignments and {h3_cell_count:,} "
+        f"derived occupied H3 cells at resolution {H3_RESOLUTION}."
+    )
 
     print("Table schema preview:")
     print(con.execute(f"PRAGMA table_info('{OVERTURE_TABLE}')").fetchdf().to_string(index=False))
@@ -1378,7 +1417,9 @@ if __name__ == "__main__":
                 class,
                 height,
                 num_floors,
-                roof_material
+                roof_material,
+                h3_resolution,
+                h3_cell_id
             FROM {OVERTURE_TABLE}
             LIMIT 8;
             """
@@ -1398,59 +1439,52 @@ if __name__ == "__main__":
         ).fetchdf().to_string(index=False)
     )
 
-    if RUN_DIRECT_REMOTE_VALIDATION:
-        selected_scope = set(top_k_municipalities["municipality_name"].astype(str).tolist())
-        print("\nDirect validation against remote Overture via DuckDB (bbox + ST_Intersects):")
-        validation_df = validate_local_vs_remote_duckdb_counts(
-            con,
-            municipality_names=DIRECT_VALIDATION_MUNICIPALITIES,
-            selected_fetch_municipality_names=selected_scope,
-            local_table_name=OVERTURE_TABLE,
-            remote_buildings_uri=OVERTURE_REMOTE_BUILDINGS_URI,
-        )
-        print(validation_df.to_string(index=False))
-        print(
-            "Interpretation: near-zero coverage for municipalities outside current fetch scope confirms "
-            "an ingest-boundary issue rather than missing source data."
-        )
+    print("Occupied H3 cells by municipality:")
+    print(
+        con.execute(
+            f"""
+            WITH occupied_h3 AS ({occupied_h3_sql})
+            SELECT
+                municipality_name,
+                COUNT(*) AS occupied_cells,
+                SUM(building_count) AS total_buildings,
+                SUM(CASE WHEN crosses_municipality_boundary THEN 1 ELSE 0 END) AS boundary_crossing_cells
+            FROM occupied_h3
+            GROUP BY municipality_name
+            ORDER BY occupied_cells DESC, municipality_name
+            LIMIT 20;
+            """
+        ).fetchdf().to_string(index=False)
+    )
 
 # %% [markdown]
-# ## Step 5 - Optional whole-island bbox export via official overturemaps client (no DB ingest by default)
+# ## Step 5 - Whole-island Overture GeoParquet cache summary
 
 # %%
 if __name__ == "__main__":
-    if RUN_ISLAND_BBOX_OFFICIAL_EXPORT:
-        island_export_path = ISLAND_BBOX_EXPORT_DIR / ISLAND_BBOX_EXPORT_FILENAME
-        island_stats = export_official_island_bbox_geoparquet_with_sql_assignment(
-            con,
-            municipalities_gdf=municipalities_gdf,
-            output_path=island_export_path,
-            release=OVERTURE_RELEASE,
-            compression=ISLAND_BBOX_EXPORT_COMPRESSION,
-        )
-        print("Official overturemaps island bbox export completed.")
-        print(f"Release: {island_stats['release']}")
-        print(f"Output GeoParquet: {island_stats['output_path']}")
+    if OVERTURE_FETCH_BACKEND == "official_island_bbox" and island_cache_stats is not None:
+        print("Whole-island Overture GeoParquet cache ready for reruns.")
+        print(f"Release: {island_cache_stats['release']}")
+        print(f"Output GeoParquet: {island_cache_stats['output_path']}")
         print(
-            f"Rows: total={island_stats['rows_total']:,}, assigned={island_stats['rows_assigned']:,}, "
-            f"unassigned={island_stats['rows_unassigned']:,}"
+            f"Rows: total={int(island_cache_stats['rows_total']):,}, assigned={int(island_cache_stats['rows_assigned']):,}, "
+            f"unassigned={int(island_cache_stats['rows_unassigned']):,}"
         )
         print(
-            f"Timing (s): fetch={island_stats['fetch_elapsed_seconds']}, "
-            f"assignment+export={island_stats['assignment_elapsed_seconds']}, "
-            f"total={island_stats['total_elapsed_seconds']}"
+            f"Timing (s): fetch={island_cache_stats['fetch_elapsed_seconds']}, "
+            f"assignment+export={island_cache_stats['assignment_elapsed_seconds']}, "
+            f"total={island_cache_stats['total_elapsed_seconds']}"
         )
         print(
             "Disk usage: "
-            f"raw_snapshot={format_size_bytes(int(island_stats['raw_snapshot_size_bytes']))}, "
-            f"compressed_output={format_size_bytes(int(island_stats['output_size_bytes']))}"
+            f"raw_snapshot={format_size_bytes(int(island_cache_stats['raw_snapshot_size_bytes']))}, "
+            f"compressed_output={format_size_bytes(int(island_cache_stats['output_size_bytes']))}"
         )
         print("Top municipality counts in island export artifact:")
-        print(island_stats["municipality_preview"].to_string(index=False))
+        print(island_cache_stats["municipality_preview"].to_string(index=False))
     else:
         print(
-            "Skipped official overturemaps whole-island export (default). "
-            "Set RUN_ISLAND_BBOX_OFFICIAL_EXPORT=True to generate external GeoParquet artifact."
+            "Whole-island cache summary is only available when OVERTURE_FETCH_BACKEND='official_island_bbox'."
         )
 
 # %% [markdown]
@@ -1463,7 +1497,7 @@ if __name__ == "__main__":
         default_municipality=str(target_row["municipality_name"]),
         neighborhood_query=TARGET_NEIGHBORHOOD_QUERY,
         neighborhood_municipality=TARGET_MUNICIPALITY,
-        limit=50000,
+        limit=150000,
     )
 
 # %% [markdown]
@@ -1471,7 +1505,7 @@ if __name__ == "__main__":
 
 # %%
 if __name__ == "__main__":
-    if ingest_temp_dir.exists():
+    if OVERTURE_FETCH_BACKEND == "maestro_geometry" and ingest_temp_dir.exists():
         shutil.rmtree(ingest_temp_dir, ignore_errors=True)
         print(f"Temporary Overture ingest directory removed: {ingest_temp_dir}")
     con.close()

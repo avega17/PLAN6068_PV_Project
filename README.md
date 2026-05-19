@@ -82,6 +82,17 @@ python -m ipykernel install --user --name pv-pr-312 --display-name "Python 3.12 
 
 Then select the `.venv` interpreter/kernel in VS Code notebooks.
 
+### Default DuckDB Artifact
+
+The project now uses a single repo-local DuckDB artifact by default:
+
+```text
+data/PR_PV_plan_data.duckdb
+```
+
+The `.env` file sets `VECTOR_DB=data/PR_PV_plan_data.duckdb`. Override it only
+when you intentionally want to write project tables somewhere else.
+
 ## Development Workflow Rules (Implemented)
 
 - Notebooks are authored first as numbered `.py` scripts using Jupytext light format.
@@ -89,6 +100,41 @@ Then select the `.venv` interpreter/kernel in VS Code notebooks.
 - Complex wrangling/segmentation logic is progressively refactored into `utils/`.
 - Critical visual outputs are exported to `outputs/figures/` and `outputs/maps/`.
 - A root, narrative-oriented E2E notebook is maintained for policy/planning communication.
+
+## Recommended Run Order
+
+Use the following order for a clean rerun from scratch when you want to refresh
+all local vector, tabular, STAC, Contextily-training, and inference artifacts
+without relying on Google Solar.
+
+1. `notebooks/vectors/01_census_geometries_ingest.py` — loads municipalities, tracts, block groups, and blocks into DuckDB.
+2. `notebooks/vectors/02_osm_pv_ingestion_and_viz.py` — ingests rooftop PV labels and updates `has_PV` flags.
+3. `notebooks/vectors/03_overture_buildings_ingest.py` — ingests whole-island Overture buildings and materializes H3 support tables.
+4. `notebooks/tabular/04_acs_5year_ingest.py` — persists the local ACS 2020 and 2024 5-year county, tract, and block-group slices.
+5. `notebooks/tabular/05_urban_blocks_2020_ingest.py` — builds the curated 2020 urban-block reference and the urban summary views used downstream.
+6. `notebooks/vectors/06_bg_tile_manifest.py` — builds the H3-based solar tile manifest from Overture + OSM labels.
+7. `notebooks/rasters/08_pr_raster_catalog_indexes.py` — builds the local Puerto Rico NAIP STAC GeoParquet, consolidates the raster catalog, and runs vector-guided preview checks.
+8. `notebooks/rasters/09_pr_stac_municipality_fetch.py` — fetches and clips the local STAC rasters for San Juan and Isabela.
+9. `notebooks/rasters/10_geoai_training_data.py` — builds the Contextily + OSM training dataset directly from the H3 manifest.
+10. `notebooks/rasters/11_geoai_solar_finetune.py` — fine-tunes Mask R-CNN on the paired Contextily chips.
+11. `notebooks/rasters/12_geoai_solar_inference.py` — runs inference over the local raster catalog with the fine-tuned model.
+12. `notebooks/tabular/13_pv_building_join.py` — joins building footprints to OSM and model-detected PV signals.
+13. `notebooks/tabular/14_pv_bg_aggregation.py` — aggregates building/PV/ACS/urban-flag metrics to the block-group level.
+14. `notebooks/extra/06_pr_poster_figures.py` — optional publication-style figures after the core tables exist.
+15. `00_e2e_master_narrative.py` — optional narrative pass once the upstream tables and artifacts are ready.
+
+### Optional Google Solar Branch
+
+If you want Google Solar assets in the mixed local raster catalog, insert this
+branch after step 6:
+
+1. `notebooks/rasters/05_solar_quality_probe.py` — optional quota/quality check before a larger API run.
+2. `notebooks/rasters/06_google_solar_api_ingest.py` — downloads Google Solar Data Layers GeoTIFFs.
+3. `notebooks/rasters/08_solar_raster_catalog.py` — rebuilds the source-aware local raster catalog to include Google Solar outputs.
+
+After that branch, continue with steps 10–16. The Contextily training dataset
+does not require Google Solar, but inference can incorporate Google Solar tiles
+once step 8 has refreshed the mixed local catalog.
 
 ## Repository Skeleton
 
@@ -115,4 +161,5 @@ Proyecto Final/
 
 ## Status
 
-Repository scaffold initialized. Next step is to create the first numbered Jupytext scripts under `notebooks/vectors/`, `notebooks/rasters/`, and `notebooks/tabular/`.
+Repository workflow is active. Use the run order above as the current reference
+for full refreshes and end-to-end reruns.

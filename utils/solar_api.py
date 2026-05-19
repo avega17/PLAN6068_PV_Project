@@ -36,6 +36,7 @@ from typing import Iterable, Literal
 from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
+import requests
 from dotenv import load_dotenv
 
 from google.api_core.exceptions import (
@@ -134,6 +135,7 @@ REQUESTED_LAYERS: dict[str, str] = {
     "annual_flux_url": "annualFlux",
     "dsm_url": "dsm",
 }
+BUILDING_INSIGHTS_ENDPOINT = "https://solar.googleapis.com/v1/buildingInsights:findClosest"
 
 
 def quality_to_pixel_size(quality: ImageryQuality) -> float:
@@ -215,12 +217,69 @@ def _append_ledger(ledger_path: Path, record: dict) -> None:
     df = _load_ledger(ledger_path)
     for col in LEDGER_COLUMNS:
         record.setdefault(col, None)
-    df = pd.concat([df, pd.DataFrame([record], columns=LEDGER_COLUMNS)], ignore_index=True)
+    row_record = {col: record.get(col) for col in LEDGER_COLUMNS}
+    if df.empty:
+        df = pd.DataFrame.from_records([row_record], columns=LEDGER_COLUMNS)
+    else:
+        records = df.to_dict(orient="records")
+        records.append(row_record)
+        df = pd.DataFrame.from_records(records, columns=LEDGER_COLUMNS)
     # Atomic replace: write to a temp file then rename so a SIGKILL mid-write
     # can never leave a half-written parquet behind.
     tmp_path = ledger_path.with_suffix(ledger_path.suffix + ".tmp")
     df.to_parquet(tmp_path, index=False)
     os.replace(tmp_path, ledger_path)
+
+
+def _date_dict_to_iso(value: dict | None) -> str | None:
+    if not value:
+        return None
+    year = value.get("year")
+    month = value.get("month")
+    day = value.get("day")
+    if not (year and month and day):
+        return None
+    return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+
+
+def _probe_quality_rest(
+    lon: float,
+    lat: float,
+    *,
+    api_key: str,
+    required_quality: ImageryQuality | None = None,
+) -> ProbeResult:
+    params = {
+        "location.latitude": f"{float(lat):.8f}",
+        "location.longitude": f"{float(lon):.8f}",
+        "key": api_key,
+    }
+    if required_quality is not None:
+        params["requiredQuality"] = required_quality
+
+    try:
+        response = requests.get(BUILDING_INSIGHTS_ENDPOINT, params=params, timeout=60)
+    except requests.RequestException as exc:
+        return ProbeResult(False, None, None, "error", None, {"body": str(exc)[:500]})
+
+    if response.status_code == 404:
+        record = {"_status": "not_found", "_http_status": 404}
+        return ProbeResult(False, None, None, "not_found", 404, record)
+
+    if not response.ok:
+        body = response.text[:500]
+        record = {"_status": "error", "_http_status": response.status_code, "body": body}
+        return ProbeResult(False, None, None, "error", response.status_code, record)
+
+    payload = response.json()
+    record = {
+        "imageryQuality": payload.get("imageryQuality"),
+        "imageryDate": _date_dict_to_iso(payload.get("imageryDate")),
+        "imageryProcessedDate": _date_dict_to_iso(payload.get("imageryProcessedDate")),
+        "_status": "ok",
+        "_http_status": response.status_code,
+    }
+    return ProbeResult(True, record["imageryQuality"], record["imageryDate"], "ok", response.status_code, record)
 
 
 def ledger_summary(ledger_path: Path = DEFAULT_LEDGER_PATH) -> dict[str, object]:
@@ -408,19 +467,26 @@ def probe_quality(
     if required_quality is not None:
         req.required_quality = _QUALITY_ENUM[required_quality]
 
-    client = _get_sync_client()
     record: dict
     try:
-        resp = client.find_closest_building_insights(request=req)
-        record = {
-            "imageryQuality": _quality_name(resp.imagery_quality),
-            "imageryDate": _date_to_iso(resp.imagery_date),
-            "imageryProcessedDate": _date_to_iso(resp.imagery_processed_date),
-            "_status": "ok",
-            "_http_status": 200,
-        }
-        _write_cached_json(key, record, cache_dir)
-        result = ProbeResult(True, record["imageryQuality"], record["imageryDate"], "ok", 200, record)
+        api_key = os.getenv("SOLAR_API_KEY") or os.getenv("GOOGLE_MAPS_API_KEY")
+        if api_key:
+            result = _probe_quality_rest(lon, lat, api_key=api_key, required_quality=required_quality)
+            record = result.raw or {}
+            if result.status in {"ok", "not_found"}:
+                _write_cached_json(key, record, cache_dir)
+        else:
+            client = _get_sync_client()
+            resp = client.find_closest_building_insights(request=req)
+            record = {
+                "imageryQuality": _quality_name(resp.imagery_quality),
+                "imageryDate": _date_to_iso(resp.imagery_date),
+                "imageryProcessedDate": _date_to_iso(resp.imagery_processed_date),
+                "_status": "ok",
+                "_http_status": 200,
+            }
+            _write_cached_json(key, record, cache_dir)
+            result = ProbeResult(True, record["imageryQuality"], record["imageryDate"], "ok", 200, record)
     except NotFound:
         record = {"_status": "not_found", "_http_status": 404}
         _write_cached_json(key, record, cache_dir)

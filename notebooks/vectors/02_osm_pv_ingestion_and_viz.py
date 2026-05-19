@@ -23,7 +23,7 @@ The notebook/script:
 - ingests filtered OSM data directly into a DuckDB staging table,
 - uses vectorized DuckDB SQL to filter non-PV records and normalize GEOMETRY,
 - updates has_PV flags and exports macro/micro narrative map artifacts.
-"""
+""" 
 
 # %%
 from __future__ import annotations
@@ -73,6 +73,20 @@ PV_TABLE_NAME = "pr_osm_rooftop_pv_polygons"
 PV_STAGE_TABLE_NAME = "pr_osm_quackosm_stage"
 SOLAR_PLANT_STAGE_TABLE_NAME = "pr_osm_solar_plant_stage"
 TARGET_MUNICIPALITY = "San Juan"
+CASE_STUDY_MUNICIPALITIES = ("San Juan", "Isabela")
+FULLY_DIGITIZED_BARRIOS = (
+    {
+        "label": "Puerto Nuevo, San Juan",
+        "query": "Puerto Nuevo, San Juan, Puerto Rico",
+        "municipality_name": "San Juan",
+    },
+    {
+        "label": "Mora, Isabela",
+        "query": "Mora, Isabela, Puerto Rico",
+        "municipality_name": "Isabela",
+    },
+)
+MICRO_MAP_ARTIFACT_NAME = "san_juan_isabela_case_study_osm_pv.html"
 
 QUACKOSM_TAGS_FILTER: dict[str, object] = {
     "generator:method": "photovoltaic",
@@ -110,7 +124,7 @@ def resolve_db_path() -> Path:
             db_path = PROJECT_ROOT / db_path if len(db_path.parts) > 1 else PROJECT_ROOT / "data" / "vectors" / db_path
         return db_path
 
-    return PROJECT_ROOT / "data" / "vectors" / "PR_vector_data.duckdb"
+    return PROJECT_ROOT / "data" / "PR_PV_plan_data.duckdb"
 
 
 def resolve_output_dir() -> Path:
@@ -174,7 +188,7 @@ def load_municipalities(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame:
             NAME AS municipality_name,
             GEOID AS municipality_geoid,
             ST_AsText(geometry) AS geometry_wkt
-        FROM pr_municipalities
+        FROM pr_census_counties
         ORDER BY NAME
         """
     ).fetchdf()
@@ -397,7 +411,7 @@ def create_clean_pv_table(
             SELECT
                 {municipality_ranked_sql}
             FROM filtered AS f
-            LEFT JOIN pr_municipalities AS m
+            LEFT JOIN pr_census_counties AS m
               ON ST_Intersects(m.geometry, f.geometry)
         )
         SELECT
@@ -527,7 +541,7 @@ def summarize_municipality_pv(con: duckdb.DuckDBPyConnection, table_name: str = 
             COUNT(*) AS pv_feature_count,
             SUM(ST_Area(ST_Transform(pv.geometry, 'EPSG:4326', 'EPSG:3857'))) AS pv_area_m2
         FROM {table_name} AS pv
-        LEFT JOIN pr_municipalities AS m
+        LEFT JOIN pr_census_counties AS m
           ON pv.municipality_geoid = m.GEOID
         GROUP BY 1
         ORDER BY pv_feature_count DESC, municipality_name
@@ -563,7 +577,7 @@ def summarize_block_coverage(con: duckdb.DuckDBPyConnection):
         """
         SELECT 'block_groups' AS geography, COUNT(*) AS total_units, SUM(CASE WHEN has_PV THEN 1 ELSE 0 END) AS pv_units,
                100.0 * SUM(CASE WHEN has_PV THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0) AS pct_with_pv
-        FROM pr_block_groups
+        FROM pr_census_block_groups
         UNION ALL
         SELECT 'census_tracts' AS geography, COUNT(*) AS total_units, SUM(CASE WHEN has_PV THEN 1 ELSE 0 END) AS pv_units,
                100.0 * SUM(CASE WHEN has_PV THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0) AS pct_with_pv
@@ -592,7 +606,7 @@ def plot_eda_summary(municipality_summary, output_dir: Path) -> Path:
 def update_has_pv_flags(con: duckdb.DuckDBPyConnection) -> None:
     """Populate has_PV booleans for municipality/tract/block group geographies."""
 
-    geography_tables = ["pr_municipalities", "pr_census_tracts", "pr_block_groups"]
+    geography_tables = ["pr_census_counties", "pr_census_tracts", "pr_census_block_groups"]
     for table_name in geography_tables:
         con.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS has_PV BOOLEAN;")
         con.execute(
@@ -636,6 +650,41 @@ def load_pv_features(con: duckdb.DuckDBPyConnection, table_name: str = PV_TABLE_
     )
 
 
+def fetch_case_study_barrios() -> gpd.GeoDataFrame:
+    """Fetch the two fully digitized barrio polygons used in the case-study map."""
+
+    frames: list[gpd.GeoDataFrame] = []
+    for barrio in FULLY_DIGITIZED_BARRIOS:
+        try:
+            gdf = ox.geocode_to_gdf(barrio["query"])
+        except Exception as exc:
+            print(f"[warn] failed to fetch barrio geometry for {barrio['query']}: {exc}")
+            continue
+
+        if gdf.empty:
+            print(f"[warn] no barrio geometry returned for {barrio['query']}")
+            continue
+
+        if gdf.crs is None:
+            gdf = gdf.set_crs(OUTPUT_CRS)
+        else:
+            gdf = gdf.to_crs(OUTPUT_CRS)
+
+        clipped = gdf[["geometry"]].copy()
+        clipped["study_area_label"] = barrio["label"]
+        clipped["municipality_name"] = barrio["municipality_name"]
+        frames.append(clipped[["study_area_label", "municipality_name", "geometry"]])
+
+    if not frames:
+        return gpd.GeoDataFrame(
+            columns=["study_area_label", "municipality_name", "geometry"],
+            geometry="geometry",
+            crs=OUTPUT_CRS,
+        )
+
+    return gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), geometry="geometry", crs=OUTPUT_CRS)
+
+
 def plot_macro_map(municipalities: gpd.GeoDataFrame, osm_features: gpd.GeoDataFrame, output_dir: Path) -> Path:
     """Save an island-wide count map using log-scaled municipality counts to reduce skew."""
 
@@ -644,7 +693,9 @@ def plot_macro_map(municipalities: gpd.GeoDataFrame, osm_features: gpd.GeoDataFr
     macro["feature_count"] = macro["feature_count"].fillna(0)
     macro["feature_count_log1p"] = np.log1p(macro["feature_count"])
 
-    fig, ax = plt.subplots(figsize=(12, 12), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(12, 12))
+    fig.subplots_adjust(left=0.03, right=0.97, top=0.94, bottom=0.14)
+    cax = fig.add_axes([0.18, 0.06, 0.64, 0.02])
     macro.to_crs(OUTPUT_CRS).plot(
         ax=ax,
         column="feature_count_log1p",
@@ -652,7 +703,8 @@ def plot_macro_map(municipalities: gpd.GeoDataFrame, osm_features: gpd.GeoDataFr
         linewidth=0.8,
         edgecolor="#1f2937",
         legend=True,
-        legend_kwds={"label": "log(1 + detected rooftop PV polygons)"},
+        cax=cax,
+        legend_kwds={"label": "log(1 + detected rooftop PV polygons)", "orientation": "horizontal"},
     )
     ax.set_title("Puerto Rico rooftop solar PV polygons by municipality (log scale)", pad=16, fontsize=16)
     ax.set_axis_off()
@@ -663,27 +715,27 @@ def plot_macro_map(municipalities: gpd.GeoDataFrame, osm_features: gpd.GeoDataFr
     return output_path
 
 
-def plot_micro_map(osm_features: gpd.GeoDataFrame, municipalities: gpd.GeoDataFrame, output_dir: Path) -> Path:
-    """Build and save an interactive Folium micro-map using a contextily provider tile URL."""
+def plot_micro_map(
+    osm_features: gpd.GeoDataFrame,
+    municipalities: gpd.GeoDataFrame,
+    output_dir: Path,
+    *,
+    study_barrios: gpd.GeoDataFrame | None = None,
+) -> tuple[folium.Map, Path]:
+    """Build and save a two-municipality case-study Folium map."""
 
-    if TARGET_MUNICIPALITY in municipalities["municipality_name"].values:
-        target_name = TARGET_MUNICIPALITY
-    else:
-        target_name = (
-            osm_features.groupby("municipality_name").size().sort_values(ascending=False).index[0]
-            if not osm_features.empty
-            else municipalities.iloc[0]["municipality_name"]
-        )
+    case_boundaries = municipalities[municipalities["municipality_name"].isin(CASE_STUDY_MUNICIPALITIES)].copy()
+    if case_boundaries.empty:
+        raise RuntimeError("Could not find San Juan and Isabela municipality boundaries for the case-study map.")
 
-    target_boundary = municipalities[municipalities["municipality_name"] == target_name]
-    target_features = osm_features[osm_features["municipality_name"] == target_name]
+    case_features = osm_features[osm_features["municipality_name"].isin(CASE_STUDY_MUNICIPALITIES)].copy()
 
     provider = ctx.providers.Esri.WorldImagery
     tile_url = provider.build_url()
     tile_attr = provider.get("html_attribution") or provider.get("attribution") or ""
 
-    centroid = target_boundary.geometry.union_all().centroid
-    micro_map = folium.Map(location=[centroid.y, centroid.x], zoom_start=13, tiles=None, control_scale=True)
+    centroid = case_boundaries.geometry.union_all().centroid
+    micro_map = folium.Map(location=[centroid.y, centroid.x], zoom_start=11, tiles=None, control_scale=True)
     folium.TileLayer(
         tiles=tile_url,
         attr=tile_attr,
@@ -693,39 +745,77 @@ def plot_micro_map(osm_features: gpd.GeoDataFrame, municipalities: gpd.GeoDataFr
         max_zoom=provider.get("max_zoom", 20),
     ).add_to(micro_map)
 
+    municipality_layer = folium.FeatureGroup(name="Case-study municipality boundaries", show=True)
     folium.GeoJson(
-        target_boundary.__geo_interface__,
-        name="Municipality boundary",
-        style_function=lambda _: {"fillColor": "#00000000", "color": "#f8fafc", "weight": 2},
-    ).add_to(micro_map)
+        case_boundaries.__geo_interface__,
+        name="Municipality boundaries",
+        style_function=lambda _: {"fillColor": "#00000000", "color": "#f8fafc", "weight": 2.2},
+        tooltip=folium.GeoJsonTooltip(fields=["municipality_name"], aliases=["Municipality"]),
+    ).add_to(municipality_layer)
+    municipality_layer.add_to(micro_map)
+
+    if study_barrios is not None and not study_barrios.empty:
+        barrio_layer = folium.FeatureGroup(name="Fully digitized barrios", show=True)
+        folium.GeoJson(
+            study_barrios.__geo_interface__,
+            name="Fully digitized barrios",
+            style_function=lambda _: {"fillColor": "#f59e0b", "color": "#92400e", "weight": 2, "fillOpacity": 0.35},
+            tooltip=folium.GeoJsonTooltip(fields=["study_area_label"], aliases=["Fully digitized area"]),
+        ).add_to(barrio_layer)
+        barrio_layer.add_to(micro_map)
 
     feature_layer = folium.FeatureGroup(name="PV polygons", show=True)
     folium.GeoJson(
-        target_features.__geo_interface__,
+        case_features.__geo_interface__,
         style_function=lambda _: {"fillColor": "#34d399", "color": "#065f46", "weight": 1, "fillOpacity": 0.65},
     ).add_to(feature_layer)
     feature_layer.add_to(micro_map)
 
     marker_cluster = MarkerCluster(name="PV centroids", overlay=True, control=True).add_to(micro_map)
-    target_features_3857 = target_features.to_crs(PLOT_CRS)
-    for idx, row in target_features.iterrows():
+    case_features_3857 = case_features.to_crs(PLOT_CRS)
+    for idx, row in case_features.iterrows():
         centroid_point = row.geometry.centroid
-        area_m2 = float(target_features_3857.loc[idx].geometry.area)
-        popup_text = f"feature_id: {row.feature_id}<br>area_m2: {area_m2:,.1f}"
+        area_m2 = float(case_features_3857.loc[idx].geometry.area)
+        popup_text = (
+            f"feature_id: {row.feature_id}<br>"
+            f"municipality: {row.municipality_name}<br>"
+            f"area_m2: {area_m2:,.1f}"
+        )
         folium.Marker(
             location=[centroid_point.y, centroid_point.x],
             popup=folium.Popup(popup_text, max_width=280),
             icon=folium.Icon(color="green", icon="bolt", prefix="fa"),
         ).add_to(marker_cluster)
 
+    legend_html = """
+    <div style="
+        position: fixed;
+        bottom: 30px;
+        left: 30px;
+        z-index: 9999;
+        background: rgba(255, 255, 255, 0.94);
+        border: 1px solid #cbd5e1;
+        border-radius: 8px;
+        padding: 10px 12px;
+        font-size: 12px;
+        line-height: 1.4;
+    ">
+        <strong>Case-study layers</strong><br>
+        <span style="display:inline-block;width:12px;height:12px;background:#34d399;border:1px solid #065f46;margin-right:6px;"></span>OSM rooftop PV polygons<br>
+        <span style="display:inline-block;width:12px;height:12px;background:#f59e0b;border:1px solid #92400e;margin-right:6px;"></span>Fully digitized barrios<br>
+        <span style="display:inline-block;width:12px;height:12px;background:#ffffff;border:2px solid #f8fafc;margin-right:6px;"></span>Case-study municipality outlines
+    </div>
+    """
+    micro_map.get_root().html.add_child(folium.Element(legend_html))
+
+    bounds = case_boundaries.total_bounds
+    micro_map.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+
     folium.LayerControl(collapsed=False).add_to(micro_map)
 
-    output_path = output_dir / "puerto_nuevo_pv.html"
+    output_path = output_dir / MICRO_MAP_ARTIFACT_NAME
     micro_map.save(str(output_path))
-    return micro_map
-
-# %%
-
+    return micro_map, output_path
 
 # %% [markdown]
 # ## Execution Steps
@@ -740,10 +830,9 @@ def plot_micro_map(osm_features: gpd.GeoDataFrame, municipalities: gpd.GeoDataFr
 DB_PATH = resolve_db_path()
 OUTPUT_DIR = resolve_output_dir()
 CACHE_DIR = resolve_cache_dir()
-OSM_PBF_PATH = resolve_cached_osm_pbf(CACHE_DIR)
+
 con = create_spatial_connection(DB_PATH)
 print(f"Connected to duckdb database: {DB_PATH}")
-print(f"Local OSM PBF for metadata enrichment: {OSM_PBF_PATH if OSM_PBF_PATH else 'not found'}")
 tables_before_quackosm = list_db_tables(con)
 print("Tables available before QuackOSM ingestion:")
 print(tables_before_quackosm.to_string(index=False))
@@ -774,6 +863,9 @@ solar_plant_run = run_extraction(
 )
 solar_plant_feature_count = count_features_in_table(con, solar_plant_run["stage_table"])
 solar_plant_run["feature_count"] = solar_plant_feature_count
+
+OSM_PBF_PATH = resolve_cached_osm_pbf(CACHE_DIR)
+print(f"Local OSM PBF for metadata enrichment: {OSM_PBF_PATH if OSM_PBF_PATH else 'not found'}")
 
 enrich_stage_metadata_from_local_pbf(con, island_run["stage_table"], OSM_PBF_PATH)
 enrich_stage_metadata_from_local_pbf(con, solar_plant_run["stage_table"], OSM_PBF_PATH)
@@ -823,7 +915,7 @@ if osm_features.empty:
 
 update_has_pv_flags(con)
 print(f"Created table: {PV_TABLE_NAME}")
-print("Updated has_PV flags in: pr_municipalities, pr_census_tracts, pr_block_groups")
+print("Updated has_PV flags in: pr_census_counties, pr_census_tracts, pr_census_block_groups")
 print(f"Detected rooftop PV polygons after SQL cleaning: {len(osm_features)}")
 print("\nCleaned PV table schema preview:")
 print(preview_table_schema(con, PV_TABLE_NAME).to_string(index=False))
@@ -837,6 +929,7 @@ print(preview_geometry_samples(osm_features, n=5).to_string(index=False))
 municipality_summary = summarize_municipality_pv(con, table_name=PV_TABLE_NAME)
 area_stats = summarize_pv_area_stats(con, table_name=PV_TABLE_NAME)
 coverage_stats = summarize_block_coverage(con)
+barrio_case_studies = fetch_case_study_barrios()
 eda_plot_path = plot_eda_summary(municipality_summary, OUTPUT_DIR)
 
 print("Municipality PV summary (top 10):")
@@ -845,14 +938,26 @@ print("\nArea statistics (m^2):")
 print(area_stats.to_string(index=False))
 print("\nCoverage statistics (% with at least one PV feature):")
 print(coverage_stats.to_string(index=False))
+print(
+    "\nFully digitized barrio overlays: "
+    + (
+        ", ".join(barrio_case_studies["study_area_label"].dropna().astype(str).unique().tolist())
+        if not barrio_case_studies.empty
+        else "none fetched"
+    )
+)
 print(f"Saved EDA bar plot to: {eda_plot_path}")
 display(Image(filename=str(eda_plot_path)))
 
 # %%
 # Step 5: generate narrative outputs.
 macro_path = plot_macro_map(municipalities, osm_features, OUTPUT_DIR)
-micro_map = plot_micro_map(osm_features, municipalities, OUTPUT_DIR)
-micro_path = OUTPUT_DIR / "puerto_nuevo_pv.html"
+micro_map, micro_path = plot_micro_map(
+    osm_features,
+    municipalities,
+    OUTPUT_DIR,
+    study_barrios=barrio_case_studies,
+)
 print(f"Saved macro map to: {macro_path}")
 print(f"Saved micro map to: {micro_path}")
 display(Image(filename=str(macro_path)))

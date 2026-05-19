@@ -32,20 +32,22 @@ from utils.raster_stac_index import load_puerto_rico_boundary
 from utils.raster_stac_index import materialize_consolidated_pr_raster_catalog
 from utils.raster_stac_index import resolve_vector_db_path
 
-NAIP_2021_CATALOG_URL = (
+NAIP_COASTAL_CATALOG_URL = (
     "https://coastalimagery.blob.core.windows.net/digitalcoast/"
     "PR_NAIP_2021_9825/stac/catalog.json"
 )
 CONSOLIDATED_CATALOG_DEFAULT_PATH = PROJECT_ROOT / "data" / "rasters" / "stac" / "pr_raster_catalog_items.parquet"
-PREFERRED_POSTER_SOURCES = ["maxar_open_data", "naip_2021_pr", "satellogic_earthview"]
+PREFERRED_POSTER_SOURCES = ["maxar_open_data", "pr_naip", "naip_2021_pr", "satellogic_earthview"]
 DEFAULT_CHIP_SIZE = 512
 METRIC_CRS = "EPSG:32619"
 SOURCE_DISPLAY_NAMES = {
+    "pr_naip": "PR NAIP",
     "naip_2021_pr": "NAIP 2021",
     "maxar_open_data": "Maxar Open Data",
     "satellogic_earthview": "EarthView",
 }
 SOURCE_GSD_CM_FALLBACKS = {
+    "pr_naip": 60.0,
     "naip_2021_pr": 60.0,
 }
 TABLE_RESOLUTION_BUCKET_THRESHOLD_CM = 45.0
@@ -129,7 +131,7 @@ def load_or_materialize_consolidated_catalog(
             materialize_consolidated_pr_raster_catalog(
                 output_path=catalog_path,
                 boundary=boundary,
-                naip_catalog_url=NAIP_2021_CATALOG_URL,
+                naip_coastal_catalog_url=NAIP_COASTAL_CATALOG_URL,
                 maxar_remote_parquet_url=MAXAR_PUBLIC_PARQUET_URI,
                 earthview_remote_parquet_url=EARTHVIEW_PUBLIC_PARQUET_URI,
             )
@@ -566,7 +568,7 @@ def summarize_top_municipalities_for_poster(
     tract_counts = con.execute(
         """
         SELECT m.NAME AS municipality_name, COUNT(*)::BIGINT AS tract_count
-        FROM pr_municipalities AS m
+        FROM pr_census_counties AS m
         JOIN pr_census_tracts AS t
           ON ST_Intersects(m.geometry, t.geometry)
         GROUP BY 1
@@ -576,8 +578,8 @@ def summarize_top_municipalities_for_poster(
     block_group_counts = con.execute(
         """
         SELECT m.NAME AS municipality_name, COUNT(*)::BIGINT AS block_group_count
-        FROM pr_municipalities AS m
-        JOIN pr_block_groups AS g
+        FROM pr_census_counties AS m
+        JOIN pr_census_block_groups AS g
           ON ST_Intersects(m.geometry, g.geometry)
         GROUP BY 1
         """
@@ -590,7 +592,7 @@ def summarize_top_municipalities_for_poster(
             GEOID AS municipality_geoid,
             NAME AS municipality_name,
             ST_AsWKB(geometry) AS geometry_wkb
-        FROM pr_municipalities
+        FROM pr_census_counties
         ORDER BY municipality_name
         """
     )
@@ -892,7 +894,12 @@ def _score_example_candidate(metrics: dict[str, Any]) -> float:
         resolution_score = 0.0
     else:
         resolution_score = max(0.0, (120.0 - float(gsd_cm)) / 20.0)
-    source_bonus = {"maxar_open_data": 0.6, "naip_2021_pr": 0.35, "satellogic_earthview": 0.2}.get(source, 0.0)
+    source_bonus = {
+        "maxar_open_data": 0.6,
+        "pr_naip": 0.35,
+        "naip_2021_pr": 0.35,
+        "satellogic_earthview": 0.2,
+    }.get(source, 0.0)
 
     return round(row_score + coverage_score + contiguity_score + ratio_score + resolution_score + source_bonus, 3)
 

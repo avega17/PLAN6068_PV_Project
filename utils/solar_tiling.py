@@ -43,6 +43,127 @@ def _coerce_metric(gdf: gpd.GeoDataFrame, metric_crs: str = PR_METRIC_CRS) -> gp
     return gdf if str(gdf.crs).upper() == metric_crs.upper() else gdf.to_crs(metric_crs)
 
 
+def build_h3_tile_manifest(
+    occupied_h3_cells_gdf: gpd.GeoDataFrame,
+    *,
+    metric_crs: str = PR_METRIC_CRS,
+    h3_id_col: str = "h3_cell_id",
+    resolution_col: str = "h3_resolution",
+    municipio_col: str = "municipality_name",
+    municipio_geoid_col: str = "municipality_geoid",
+    building_count_col: str = "building_count",
+    municipality_building_count_col: str = "municipality_building_count",
+) -> gpd.GeoDataFrame:
+    """Build a manifest from occupied H3 cells while preserving legacy columns.
+
+    ``bg_geoid`` is retained as a compatibility alias so the downstream Solar API
+    storage layout can migrate in a later step without breaking callers now.
+    """
+
+    columns = [
+        "tile_id",
+        "bg_geoid",
+        "h3_cell_id",
+        "h3_resolution",
+        "municipio",
+        "municipio_geoid",
+        "lon",
+        "lat",
+        "radius_m",
+        "building_count",
+        "municipality_building_count",
+        "crosses_municipality_boundary",
+        "geometry",
+    ]
+    if occupied_h3_cells_gdf.empty:
+        return gpd.GeoDataFrame(columns=columns, geometry="geometry", crs="EPSG:4326")
+
+    if h3_id_col not in occupied_h3_cells_gdf.columns:
+        raise ValueError(f"Expected occupied H3 cells to include column {h3_id_col!r}.")
+
+    cells = occupied_h3_cells_gdf.copy()
+    if cells.crs is None:
+        cells = cells.set_crs("EPSG:4326")
+    else:
+        cells = cells.to_crs("EPSG:4326")
+
+    metric_cells = _coerce_metric(cells[["geometry"]].copy(), metric_crs)
+    equivalent_radius = np.ceil(np.sqrt(metric_cells.geometry.area.to_numpy(dtype=float) / math.pi)).astype(int)
+
+    if {"cell_center_lon", "cell_center_lat"}.issubset(cells.columns):
+        lon = pd.to_numeric(cells["cell_center_lon"], errors="coerce")
+        lat = pd.to_numeric(cells["cell_center_lat"], errors="coerce")
+    else:
+        centroids = cells.geometry.centroid
+        lon = centroids.x
+        lat = centroids.y
+
+    result = gpd.GeoDataFrame(
+        {
+            "tile_id": cells[h3_id_col].astype("string"),
+            "bg_geoid": cells[h3_id_col].astype("string"),
+            "h3_cell_id": cells[h3_id_col].astype("string"),
+            "h3_resolution": pd.to_numeric(cells.get(resolution_col, pd.Series(index=cells.index, dtype="int64")), errors="coerce").astype("Int64"),
+            "municipio": cells.get(municipio_col, pd.Series(index=cells.index, dtype="string")).astype("string"),
+            "municipio_geoid": cells.get(municipio_geoid_col, pd.Series(index=cells.index, dtype="string")).astype("string"),
+            "lon": lon.astype(float),
+            "lat": lat.astype(float),
+            "radius_m": equivalent_radius.astype(int),
+            "building_count": pd.to_numeric(cells.get(building_count_col, 0), errors="coerce").fillna(0).astype(int),
+            "municipality_building_count": pd.to_numeric(
+                cells.get(municipality_building_count_col, cells.get(building_count_col, 0)),
+                errors="coerce",
+            ).fillna(0).astype(int),
+            "crosses_municipality_boundary": cells.get(
+                "crosses_municipality_boundary",
+                pd.Series(False, index=cells.index, dtype="bool"),
+            ).fillna(False).astype(bool),
+        },
+        geometry=cells.geometry.copy(),
+        crs="EPSG:4326",
+    )
+    return result[columns].reset_index(drop=True)
+
+
+def attach_h3_priority(
+    tile_manifest: gpd.GeoDataFrame,
+    *,
+    osm_pv_polygons: gpd.GeoDataFrame | None = None,
+    seed_neighborhoods: gpd.GeoDataFrame | None = None,
+) -> gpd.GeoDataFrame:
+    """Attach priority metadata to an occupied-H3-cell manifest."""
+
+    result = tile_manifest.copy()
+    if result.empty:
+        result["osm_pv_count"] = pd.Series(dtype="int64")
+        result["priority_score"] = pd.Series(dtype="int64")
+        return result
+
+    result["building_count"] = pd.to_numeric(result.get("building_count", 0), errors="coerce").fillna(0).astype(int)
+    result["osm_pv_count"] = 0
+    result["priority_score"] = 1
+
+    if osm_pv_polygons is not None and not osm_pv_polygons.empty:
+        osm = osm_pv_polygons.to_crs("EPSG:4326")
+        pv_points = gpd.GeoDataFrame(geometry=osm.geometry.representative_point(), crs="EPSG:4326")
+        joined = gpd.sjoin(pv_points, result[["h3_cell_id", "geometry"]], predicate="within", how="inner")
+        if not joined.empty:
+            counts = joined.groupby("h3_cell_id").size().rename("osm_pv_count")
+            result = result.merge(counts, on="h3_cell_id", how="left", suffixes=("", "_new"))
+            result["osm_pv_count"] = result["osm_pv_count_new"].fillna(result["osm_pv_count"]).astype(int)
+            result = result.drop(columns=[c for c in result.columns if c.endswith("_new")])
+        result["priority_score"] = result["priority_score"].where(result["osm_pv_count"] == 0, 2)
+
+    if seed_neighborhoods is not None and not seed_neighborhoods.empty:
+        seeds = seed_neighborhoods.to_crs("EPSG:4326")
+        seed_union = unary_union(seeds.geometry.values)
+        result["priority_score"] = result["priority_score"].where(~result.geometry.intersects(seed_union), 3)
+
+    result["osm_pv_count"] = result["osm_pv_count"].fillna(0).astype(int)
+    result["priority_score"] = result["priority_score"].fillna(1).astype(int)
+    return result
+
+
 def _grid_points(polygon: Polygon, spacing_m: float) -> list[Point]:
     """Interior grid covering the polygon envelope, spaced ``spacing_m`` apart."""
 
@@ -238,7 +359,9 @@ __all__ = [
     "DEFAULT_SPACING_M",
     "PR_METRIC_CRS",
     "TileCandidate",
+    "attach_h3_priority",
     "attach_priority",
+    "build_h3_tile_manifest",
     "build_tile_manifest",
     "tile_block_group",
 ]

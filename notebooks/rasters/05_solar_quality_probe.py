@@ -5,8 +5,10 @@
 # `pr_solar_tile_manifest` with its best-available imagery quality before we
 # spend any Data Layers quota.
 #
-# One BG centroid is typically sufficient; we sample up to
-# `MAX_PROBES_PER_BG` tile centers per BG for robustness against edge cases.
+# The manifest is now H3-cell based, so probing one row per legacy `bg_geoid`
+# would hit every tile. We instead probe a stratified subset of candidate tiles
+# per municipality and classify them as `ready`, `stale_pre_maria`,
+# `no_coverage`, or `probe_failed`.
 
 # %%
 """05_solar_quality_probe.py
@@ -42,7 +44,10 @@ load_dotenv(PROJECT_ROOT / ".env")
 from utils.solar_api import probe_points, ledger_summary  # noqa: E402
 
 MANIFEST_TABLE = "pr_solar_tile_manifest"
-MAX_PROBES_PER_BG = 1  # bump to 2-3 if we observe within-BG quality heterogeneity
+PROBE_PENDING_STATUSES = ("pending", "probe_failed")
+PROBE_BUCKETS = 8
+MAX_PROBES_PER_BUCKET = 6
+POST_MARIA_CUTOFF = pd.Timestamp("2017-09-20")
 
 
 def resolve_db_path() -> Path:
@@ -52,38 +57,127 @@ def resolve_db_path() -> Path:
         if not p.is_absolute():
             p = PROJECT_ROOT / p if len(p.parts) > 1 else PROJECT_ROOT / "data" / "vectors" / p
         return p
-    return PROJECT_ROOT / "data" / "vectors" / "PR_vector_data.duckdb"
+    return PROJECT_ROOT / "data" / "PR_PV_plan_data.duckdb"
 
 
 # %%
-def load_probe_points(con: duckdb.DuckDBPyConnection, max_per_bg: int = MAX_PROBES_PER_BG) -> pd.DataFrame:
+def load_probe_points(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    statuses: tuple[str, ...] = PROBE_PENDING_STATUSES,
+    probe_buckets: int = PROBE_BUCKETS,
+    max_per_bucket: int = MAX_PROBES_PER_BUCKET,
+) -> pd.DataFrame:
+    status_sql = ", ".join(f"'{status}'" for status in statuses)
     return con.execute(
         f"""
-        WITH ranked AS (
+        WITH candidates AS (
             SELECT
-                tile_id, bg_geoid, municipio, lon, lat, building_count,
-                ROW_NUMBER() OVER (
-                    PARTITION BY bg_geoid
-                    ORDER BY building_count DESC, tile_id
-                ) AS rn
+                tile_id,
+                bg_geoid,
+                h3_cell_id,
+                municipio,
+                lon,
+                lat,
+                priority_score,
+                building_count,
+                osm_pv_count,
+                status,
+                required_quality
             FROM {MANIFEST_TABLE}
+            WHERE status IN ({status_sql})
+        ),
+        bucketed AS (
+            SELECT
+                *,
+                NTILE({probe_buckets}) OVER (
+                    PARTITION BY municipio
+                    ORDER BY priority_score DESC, osm_pv_count DESC, building_count DESC, tile_id
+                ) AS priority_bucket
+            FROM candidates
+        ),
+        ranked AS (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY municipio, priority_bucket
+                    ORDER BY building_count DESC, osm_pv_count DESC, tile_id
+                ) AS bucket_rank
+            FROM bucketed
         )
-        SELECT tile_id, bg_geoid, municipio, lon, lat
+        SELECT tile_id, bg_geoid, h3_cell_id, municipio, lon, lat, priority_score, priority_bucket, status, required_quality
         FROM ranked
-        WHERE rn <= {max_per_bg}
-        ORDER BY bg_geoid, rn;
+        WHERE bucket_rank <= {max_per_bucket}
+        ORDER BY municipio, priority_bucket, bucket_rank, tile_id;
         """
     ).fetchdf()
 
 
-def collapse_bg_quality(probe_df: pd.DataFrame) -> pd.DataFrame:
-    """Per BG, pick the best quality any probed point returned (HIGH>MEDIUM>BASE)."""
+def ensure_probe_columns(con: duckdb.DuckDBPyConnection) -> None:
+    """Add probe-status detail columns to the manifest when missing."""
+
+    existing = set(
+        con.execute(
+            f"""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = '{MANIFEST_TABLE}';
+            """
+        ).fetchdf()["column_name"]
+    )
+    required_columns = {
+        "probe_imagery_date": "DATE",
+        "probe_http_status": "INTEGER",
+        "probe_last_checked_utc": "TIMESTAMP",
+    }
+    for column_name, column_type in required_columns.items():
+        if column_name not in existing:
+            con.execute(f"ALTER TABLE {MANIFEST_TABLE} ADD COLUMN {column_name} {column_type};")
+
+
+def collapse_probe_quality(probe_df: pd.DataFrame) -> pd.DataFrame:
+    """Per tile, keep the best returned quality plus post-Maria classification."""
 
     rank = {"HIGH": 3, "MEDIUM": 2, "BASE": 1}
     probe_df = probe_df.copy()
-    probe_df["rank"] = probe_df["expected_quality"].map(rank).fillna(0).astype(int)
-    best = probe_df.sort_values("rank", ascending=False).groupby("bg_geoid", as_index=False).first()
-    return best[["bg_geoid", "expected_quality", "status", "imagery_date"]]
+    probe_df["imagery_date"] = pd.to_datetime(probe_df["imagery_date"], errors="coerce")
+    probe_df["quality_rank"] = probe_df["expected_quality"].map(rank).fillna(0).astype(int)
+    probe_df["is_post_maria"] = probe_df["imagery_date"] >= POST_MARIA_CUTOFF
+    best = (
+        probe_df.sort_values(["quality_rank", "imagery_date"], ascending=[False, False])
+        .groupby("tile_id", as_index=False)
+        .first()
+    )
+    best["manifest_status"] = "probe_failed"
+    best.loc[best["status"] == "not_found", "manifest_status"] = "no_coverage"
+    best.loc[(best["status"] == "ok") & best["is_post_maria"], "manifest_status"] = "ready"
+    best.loc[(best["status"] == "ok") & ~best["is_post_maria"], "manifest_status"] = "stale_pre_maria"
+    return best[["tile_id", "expected_quality", "status", "http_status", "imagery_date", "manifest_status"]]
+
+
+def summarize_probe_results(probe_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return compact quality/date diagnostics for the current probe sample."""
+
+    probe_df = probe_df.copy()
+    probe_df["imagery_date"] = pd.to_datetime(probe_df["imagery_date"], errors="coerce")
+    probe_df["imagery_period"] = pd.Series(pd.NA, index=probe_df.index, dtype="object")
+    probe_df.loc[probe_df["imagery_date"].notna(), "imagery_period"] = "pre_maria"
+    probe_df.loc[probe_df["imagery_date"] >= POST_MARIA_CUTOFF, "imagery_period"] = "post_maria"
+
+    by_status = (
+        probe_df.groupby(["municipio", "status", "expected_quality", "imagery_period"], dropna=False)
+        .size()
+        .reset_index(name="tiles")
+        .sort_values(["municipio", "tiles", "status"], ascending=[True, False, True])
+    )
+    failures = (
+        probe_df[probe_df["status"] != "ok"]
+        .groupby(["status", "http_status"], dropna=False)
+        .size()
+        .reset_index(name="tiles")
+        .sort_values("tiles", ascending=False)
+    )
+    return by_status, failures
 
 
 # %% [markdown]
@@ -94,47 +188,78 @@ if __name__ == "__main__":
     db_path = resolve_db_path()
     con = duckdb.connect(str(db_path))
     con.execute("INSTALL spatial; LOAD spatial;")
+    ensure_probe_columns(con)
 
     points_df = load_probe_points(con)
-    print(f"probing {len(points_df):,} points across {points_df['bg_geoid'].nunique():,} BGs")
+    print(
+        f"probing {len(points_df):,} stratified tile points across "
+        f"{points_df['municipio'].nunique():,} municipalities and {points_df['priority_bucket'].nunique():,} priority buckets"
+    )
 
     tuples = list(points_df[["tile_id", "bg_geoid", "municipio", "lon", "lat"]].itertuples(index=False, name=None))
     probe_df = probe_points(tuples)
     print(probe_df["expected_quality"].value_counts(dropna=False).to_string())
     print(probe_df["status"].value_counts(dropna=False).to_string())
+    sample_summary, failure_summary = summarize_probe_results(probe_df)
+    print("\nProbe sample summary:")
+    print(sample_summary.to_string(index=False))
+    if not failure_summary.empty:
+        print("\nProbe failures:")
+        print(failure_summary.to_string(index=False))
 
 # %% [markdown]
 # ## Step 2 — Collapse to BG-level best quality, update manifest
 
 # %%
 if __name__ == "__main__":
-    best_per_bg = collapse_bg_quality(probe_df)
-    con.register("bg_quality", best_per_bg.rename(columns={"status": "probe_status"}))
+    best_per_tile = collapse_probe_quality(probe_df)
+    con.register("tile_quality", best_per_tile.rename(columns={"status": "probe_status"}))
     con.execute(
         f"""
         UPDATE {MANIFEST_TABLE} AS m
         SET
             expected_quality = q.expected_quality,
-            required_quality = q.expected_quality,
+            required_quality = COALESCE(q.expected_quality, m.required_quality),
             status = CASE
                 WHEN q.probe_status = 'not_found' THEN 'no_coverage'
-                WHEN q.expected_quality IS NULL THEN 'probe_failed'
-                ELSE 'ready'
+                WHEN q.manifest_status = 'ready' THEN 'ready'
+                WHEN q.manifest_status = 'stale_pre_maria' THEN 'stale_pre_maria'
+                ELSE 'probe_failed'
             END
-        FROM bg_quality AS q
-        WHERE m.bg_geoid = q.bg_geoid;
+            ,probe_imagery_date = CAST(q.imagery_date AS DATE)
+            ,probe_http_status = q.http_status
+            ,probe_last_checked_utc = CURRENT_TIMESTAMP
+        FROM tile_quality AS q
+        WHERE m.tile_id = q.tile_id;
         """
     )
-    con.unregister("bg_quality")
+    con.unregister("tile_quality")
 
     summary = con.execute(
         f"""
-        SELECT status, expected_quality, COUNT(*) AS tiles
+        SELECT status, expected_quality, required_quality, COUNT(*) AS tiles
         FROM {MANIFEST_TABLE}
-        GROUP BY 1, 2
-        ORDER BY 1, 2;
+        GROUP BY 1, 2, 3
+        ORDER BY tiles DESC, status, expected_quality, required_quality;
         """
     ).fetchdf()
     print(summary.to_string(index=False))
+    post_maria_summary = con.execute(
+        f"""
+        SELECT
+            CASE
+                WHEN probe_imagery_date >= DATE '{POST_MARIA_CUTOFF.date().isoformat()}' THEN 'post_maria'
+                WHEN probe_imagery_date IS NULL THEN 'unknown'
+                ELSE 'pre_maria'
+            END AS imagery_period,
+            status,
+            COUNT(*) AS tiles
+        FROM {MANIFEST_TABLE}
+        GROUP BY 1, 2
+        ORDER BY tiles DESC, imagery_period, status;
+        """
+    ).fetchdf()
+    print("\nManifest imagery-period summary:")
+    print(post_maria_summary.to_string(index=False))
     print("ledger so far:", ledger_summary())
     con.close()
