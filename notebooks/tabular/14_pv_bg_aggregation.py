@@ -74,6 +74,16 @@ BG_AGG_TABLE = "pr_pv_bg_aggregates"
 
 TARGET_MUNICIPALITIES = ("San Juan", "Isabela")
 ACS_VINTAGE = 2024
+TARGET_SCOPE_STEM = "_".join(municipio.lower().replace(" ", "_") for municipio in TARGET_MUNICIPALITIES)
+NSRDB_MULTIYEAR_FLUX_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "tabular"
+    / "nsrdb"
+    / "normalized"
+    / f"{TARGET_SCOPE_STEM}_nsrdb_multiyear_flux_means.parquet"
+)
+NSRDB_BG_COLUMNS = ("ghi", "dni", "dhi", "air_temperature")
 
 # ACS variable set. Race/Hispanic uses B03002 so we can compute a
 # Census-2020-style Diversity Index from mutually-exclusive groups when the
@@ -135,8 +145,57 @@ def _to_bytes(value: object) -> bytes:
     return bytes(value)
 
 
+def load_nsrdb_multiyear_flux_means() -> pd.DataFrame:
+    if not NSRDB_MULTIYEAR_FLUX_PATH.exists():
+        return pd.DataFrame(columns=["site_id", "latitude", "longitude", *NSRDB_BG_COLUMNS])
+
+    frame = pd.read_parquet(NSRDB_MULTIYEAR_FLUX_PATH)
+    required_columns = {"site_id", "latitude", "longitude"}
+    missing_columns = sorted(required_columns - set(frame.columns))
+    if missing_columns:
+        raise RuntimeError(
+            "NSRDB multiyear flux summary is missing required columns: " + ", ".join(missing_columns)
+        )
+
+    keep_columns = [column_name for column_name in ("site_id", "latitude", "longitude", *NSRDB_BG_COLUMNS) if column_name in frame.columns]
+    return frame[keep_columns].copy()
+
+
+def stage_nsrdb_multiyear_sites(con: duckdb.DuckDBPyConnection) -> int:
+    frame = load_nsrdb_multiyear_flux_means()
+    if frame.empty:
+        con.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE nsrdb_multiyear_sites AS
+            SELECT CAST(NULL AS BIGINT) AS site_id,
+                   CAST(NULL AS DOUBLE) AS latitude,
+                   CAST(NULL AS DOUBLE) AS longitude,
+                   CAST(NULL AS DOUBLE) AS ghi,
+                   CAST(NULL AS DOUBLE) AS dni,
+                   CAST(NULL AS DOUBLE) AS dhi,
+                   CAST(NULL AS DOUBLE) AS air_temperature,
+                   CAST(NULL AS GEOMETRY) AS geometry
+            WHERE FALSE;
+            """
+        )
+        return 0
+
+    con.register("staged_nsrdb_multiyear_sites", frame)
+    con.execute(
+        """
+        CREATE OR REPLACE TEMP TABLE nsrdb_multiyear_sites AS
+        SELECT *,
+               ST_Point(CAST(longitude AS DOUBLE), CAST(latitude AS DOUBLE)) AS geometry
+        FROM staged_nsrdb_multiyear_sites;
+        """
+    )
+    con.unregister("staged_nsrdb_multiyear_sites")
+    return int(len(frame))
+
+
 # %%
 def build_bg_pv_flux_aggregates(con: duckdb.DuckDBPyConnection) -> None:
+    stage_nsrdb_multiyear_sites(con)
     munis_sql = ", ".join(f"'{m}'" for m in TARGET_MUNICIPALITIES)
     con.execute(
         f"""
@@ -167,6 +226,7 @@ def build_bg_pv_flux_aggregates(con: duckdb.DuckDBPyConnection) -> None:
                 b.building_id,
                 b.has_pv_osm,
                 b.has_pv_detected,
+                b.has_pv_any,
                 b.pv_detected_count,
                 b.pv_detected_area_deg2,
                 b.annual_flux_mean_kwh_per_kw_yr,
@@ -174,26 +234,56 @@ def build_bg_pv_flux_aggregates(con: duckdb.DuckDBPyConnection) -> None:
             FROM pr_buildings_with_pv AS b
             JOIN bg_in_muni AS bim
               ON bim.rn = 1 AND ST_Within(ST_Centroid(b.geometry), bim.bg_geom)
+        ),
+        pv_bg AS (
+            SELECT
+                bg_geoid,
+                ANY_VALUE(municipio) AS municipio,
+                COUNT(*) AS building_count,
+                SUM(CAST(has_pv_osm AS INT)) AS osm_pv_count,
+                SUM(CAST(has_pv_detected AS INT)) AS detected_pv_count,
+                SUM(CAST(has_pv_any AS INT)) AS any_pv_signal_count,
+                SUM(CAST(has_pv_osm AND has_pv_detected AS INT)) AS overlap_count,
+                SUM(pv_detected_area_deg2) AS total_detected_area_deg2,
+                CASE WHEN COUNT(*) = 0 THEN 0.0
+                     ELSE SUM(CAST(has_pv_osm AS INT))::DOUBLE / COUNT(*)
+                END AS osm_pv_rate,
+                CASE WHEN COUNT(*) = 0 THEN 0.0
+                     ELSE SUM(CAST(has_pv_detected AS INT))::DOUBLE / COUNT(*)
+                END AS detected_pv_rate,
+                CASE WHEN COUNT(*) = 0 THEN 0.0
+                     ELSE SUM(CAST(has_pv_any AS INT))::DOUBLE / COUNT(*)
+                END AS any_pv_signal_rate,
+                CASE WHEN SUM(COALESCE(annual_flux_pixel_count, 0)) = 0 THEN NULL
+                     ELSE SUM(annual_flux_mean_kwh_per_kw_yr * annual_flux_pixel_count)
+                          / SUM(annual_flux_pixel_count)
+                END AS annual_flux_mean_kwh_per_kw_yr,
+                SUM(COALESCE(annual_flux_pixel_count, 0)) AS flux_pixel_count
+            FROM bld_bg
+            GROUP BY bg_geoid
+        ),
+        nsrdb_bg AS (
+            SELECT
+                bim.bg_geoid,
+                COUNT(*) AS nsrdb_site_count,
+                AVG(s.ghi) AS nsrdb_ghi_mean,
+                AVG(s.dni) AS nsrdb_dni_mean,
+                AVG(s.dhi) AS nsrdb_dhi_mean,
+                AVG(s.air_temperature) AS nsrdb_air_temperature_mean
+            FROM bg_in_muni AS bim
+            JOIN nsrdb_multiyear_sites AS s
+              ON bim.rn = 1 AND ST_Within(s.geometry, bim.bg_geom)
+            GROUP BY bim.bg_geoid
         )
         SELECT
-            bg_geoid,
-            ANY_VALUE(municipio) AS municipio,
-            COUNT(*) AS building_count,
-            SUM(CAST(has_pv_osm AS INT)) AS osm_pv_count,
-            SUM(CAST(has_pv_detected AS INT)) AS detected_pv_count,
-            SUM(CAST(has_pv_osm AND has_pv_detected AS INT)) AS overlap_count,
-            SUM(pv_detected_area_deg2) AS total_detected_area_deg2,
-            CASE WHEN COUNT(*) = 0 THEN 0.0
-                 ELSE SUM(CAST(has_pv_detected AS INT))::DOUBLE / COUNT(*)
-            END AS detected_pv_rate,
-            -- Pixel-weighted BG flux mean.
-            CASE WHEN SUM(COALESCE(annual_flux_pixel_count, 0)) = 0 THEN NULL
-                 ELSE SUM(annual_flux_mean_kwh_per_kw_yr * annual_flux_pixel_count)
-                      / SUM(annual_flux_pixel_count)
-            END AS annual_flux_mean_kwh_per_kw_yr,
-            SUM(COALESCE(annual_flux_pixel_count, 0)) AS flux_pixel_count
-        FROM bld_bg
-        GROUP BY bg_geoid;
+            pv_bg.*,
+            COALESCE(nsrdb_bg.nsrdb_site_count, 0) AS nsrdb_site_count,
+            nsrdb_bg.nsrdb_ghi_mean,
+            nsrdb_bg.nsrdb_dni_mean,
+            nsrdb_bg.nsrdb_dhi_mean,
+            nsrdb_bg.nsrdb_air_temperature_mean
+        FROM pv_bg
+        LEFT JOIN nsrdb_bg USING (bg_geoid);
         """
     )
 
@@ -372,148 +462,165 @@ def plot_choropleth(gdf: gpd.GeoDataFrame, column: str, title: str, out_path: Pa
 
 # %%
 # Notebook driver: connect, aggregate, merge ACS, render choropleths.
-db_path = resolve_db_path()
-con = create_spatial_connection(db_path)
+if __name__ == "__main__":
+    db_path = resolve_db_path()
+    con = create_spatial_connection(db_path)
 
-print("[1/6] building BG PV + flux aggregates …")
-build_bg_pv_flux_aggregates(con)
+    print("[1/6] building BG PV + flux aggregates …")
+    build_bg_pv_flux_aggregates(con)
+    nsrdb_site_count = con.execute("SELECT COUNT(*) FROM nsrdb_multiyear_sites;").fetchone()[0]
+    print(f"      staged NSRDB multiyear sites: {nsrdb_site_count:,}")
 
-print(f"[2/6] loading local ACS {ACS_VINTAGE} 5-yr block groups …")
-acs_df = load_local_acs_block_groups(con)
-print(f"      loaded {len(acs_df):,} BG rows from local storage")
-con.register("acs_bg", acs_df)
+    print(f"[2/6] loading local ACS {ACS_VINTAGE} 5-yr block groups …")
+    acs_df = load_local_acs_block_groups(con)
+    print(f"      loaded {len(acs_df):,} BG rows from local storage")
+    con.register("acs_bg", acs_df)
 
-print("[3/6] validating ACS coverage and joining 2020 urban summary context …")
-assert_target_acs_coverage(con, "acs_bg")
-urban_df = load_urban_flags(con)
-if urban_df.empty:
-    urban_df = pd.DataFrame(
-        {
-            "bg_geoid": [],
-            "urban_block_count": [],
-            "total_urban_pop": [],
-            "total_urban_housing_units": [],
-            "urban_land_area_m2": [],
-            "pct_urban_pop": [],
-            "pct_urban_population": [],
-            "pct_urban_housing_units": [],
-            "pct_urban_land_area": [],
-            "is_urban": [],
-        }
-    )
-con.register("urban_bg", urban_df)
-con.execute(
-    f"""
-    CREATE OR REPLACE TABLE {BG_AGG_TABLE} AS
-    SELECT a.*,
-           acs.* EXCLUDE (bg_geoid),
-           COALESCE(u.urban_block_count, 0) AS urban_block_count,
-           COALESCE(u.total_urban_pop, 0) AS total_urban_pop,
-           COALESCE(u.total_urban_housing_units, 0) AS total_urban_housing_units,
-           COALESCE(u.urban_land_area_m2, 0) AS urban_land_area_m2,
-           u.pct_urban_pop,
-           u.pct_urban_population,
-           u.pct_urban_housing_units,
-           u.pct_urban_land_area,
-           COALESCE(u.is_urban, FALSE) AS is_urban
-    FROM {BG_AGG_TABLE} AS a
-    LEFT JOIN acs_bg AS acs ON acs.bg_geoid = a.bg_geoid
-    LEFT JOIN urban_bg AS u ON u.bg_geoid = a.bg_geoid;
-    """
-)
-con.unregister("acs_bg")
-con.unregister("urban_bg")
-
-# %%
-print("[4/6] exporting aggregate CSV …")
-FIG_DIR.mkdir(parents=True, exist_ok=True)
-csv_out = FIG_DIR / "pv_bg_aggregates_sj_isabela.csv"
-con.execute(f"COPY {BG_AGG_TABLE} TO '{csv_out}' (HEADER, DELIMITER ',');")
-print(f"      wrote {csv_out}")
-
-# %%
-print("[5/6] building choropleths for San Juan + Isabela …")
-bg_gdf = load_bg_geometries(con)
-plot_choropleth(
-    bg_gdf, "detected_pv_rate",
-    "Detected PV rate (per building)",
-    MAP_DIR / "pv_detection_rate_choropleth.png",
-    cmap="YlOrBr",
-)
-plot_choropleth(
-    bg_gdf, "annual_flux_mean_kwh_per_kw_yr",
-    "Mean annual solar flux (kWh/kW/yr)",
-    MAP_DIR / "annual_flux_choropleth.png",
-    cmap="plasma",
-)
-plot_choropleth(
-    bg_gdf, "median_household_income_usd",
-    "ACS median household income (USD)",
-    MAP_DIR / "acs_income_choropleth.png",
-    cmap="viridis",
-)
-plot_choropleth(
-    bg_gdf, "pct_bachelor_plus",
-    "Share age 25+ with Bachelor's or higher",
-    MAP_DIR / "acs_education_choropleth.png",
-    cmap="BuGn",
-)
-plot_choropleth(
-    bg_gdf, "diversity_index",
-    "Census 2020 Diversity Index (from ACS B03002)",
-    MAP_DIR / "acs_diversity_index_choropleth.png",
-    cmap="magma",
-)
-# Urban/rural flag: plot as 0/1 category (no quantile binning needed).
-if "is_urban" in bg_gdf.columns and bg_gdf["is_urban"].notna().any():
-    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
-    for ax, muni in zip(axes, TARGET_MUNICIPALITIES):
-        subset = bg_gdf[bg_gdf["municipio"] == muni]
-        if subset.empty:
-            ax.set_title(f"{muni}: no data")
-            ax.set_axis_off()
-            continue
-        subset.assign(is_urban_int=subset["is_urban"].astype(int)).plot(
-            column="is_urban_int", ax=ax, cmap="coolwarm",
-            categorical=True, legend=True, edgecolor="#555", linewidth=0.2,
+    print("[3/6] validating ACS coverage and joining 2020 urban summary context …")
+    assert_target_acs_coverage(con, "acs_bg")
+    urban_df = load_urban_flags(con)
+    if urban_df.empty:
+        urban_df = pd.DataFrame(
+            {
+                "bg_geoid": [],
+                "urban_block_count": [],
+                "total_urban_pop": [],
+                "total_urban_housing_units": [],
+                "urban_land_area_m2": [],
+                "pct_urban_pop": [],
+                "pct_urban_population": [],
+                "pct_urban_housing_units": [],
+                "pct_urban_land_area": [],
+                "is_urban": [],
+            }
         )
-        ax.set_title(f"{muni} — urban (2020) vs. rural BGs")
-        ax.set_axis_off()
-    fig.tight_layout()
-    out = MAP_DIR / "urban_rural_2020_choropleth.png"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=140, bbox_inches="tight")
-    plt.close(fig)
-    print(f"wrote {out}")
+    con.register("urban_bg", urban_df)
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE {BG_AGG_TABLE} AS
+        SELECT a.*,
+               acs.* EXCLUDE (bg_geoid),
+               COALESCE(u.urban_block_count, 0) AS urban_block_count,
+               COALESCE(u.total_urban_pop, 0) AS total_urban_pop,
+               COALESCE(u.total_urban_housing_units, 0) AS total_urban_housing_units,
+               COALESCE(u.urban_land_area_m2, 0) AS urban_land_area_m2,
+               u.pct_urban_pop,
+               u.pct_urban_population,
+               u.pct_urban_housing_units,
+               u.pct_urban_land_area,
+               COALESCE(u.is_urban, FALSE) AS is_urban
+        FROM {BG_AGG_TABLE} AS a
+        LEFT JOIN acs_bg AS acs ON acs.bg_geoid = a.bg_geoid
+        LEFT JOIN urban_bg AS u ON u.bg_geoid = a.bg_geoid;
+        """
+    )
+    con.unregister("acs_bg")
+    con.unregister("urban_bg")
 
-# %%
-print("[7/6] Moran's I on detected_pv_rate …")
-try:
-    from libpysal.weights import Queen
-    from esda.moran import Moran
+    # %%
+    print("[4/6] exporting aggregate CSV …")
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    csv_out = FIG_DIR / "pv_bg_aggregates_sj_isabela.csv"
+    con.execute(f"COPY {BG_AGG_TABLE} TO '{csv_out}' (HEADER, DELIMITER ',');")
+    print(f"      wrote {csv_out}")
 
-    mo_rows = []
-    for muni in TARGET_MUNICIPALITIES:
-        subset = bg_gdf[(bg_gdf["municipio"] == muni) & bg_gdf["detected_pv_rate"].notna()].copy()
-        if len(subset) < 5:
-            continue
-        w = Queen.from_dataframe(subset, use_index=False)
-        w.transform = "r"
-        moran = Moran(subset["detected_pv_rate"].values, w, permutations=999)
-        mo_rows.append({
-            "municipio": muni,
-            "n_bgs": len(subset),
-            "morans_I": moran.I,
-            "p_sim": moran.p_sim,
-            "z_sim": moran.z_sim,
-        })
-    if mo_rows:
-        mo_df = pd.DataFrame(mo_rows)
-        mo_out = FIG_DIR / "pv_bg_morans_i.csv"
-        mo_df.to_csv(mo_out, index=False)
-        print(mo_df.to_string(index=False))
-        print(f"      wrote {mo_out}")
-except Exception as exc:
-    print(f"Moran's I step skipped: {exc}")
+    # %%
+    print("[5/6] building choropleths for San Juan + Isabela …")
+    bg_gdf = load_bg_geometries(con)
+    plot_choropleth(
+        bg_gdf, "any_pv_signal_rate",
+        "Any PV signal rate (OSM or inference, per building)",
+        MAP_DIR / "pv_any_signal_rate_choropleth.png",
+        cmap="YlOrBr",
+    )
+    plot_choropleth(
+        bg_gdf, "detected_pv_rate",
+        "Inference PV rate (per building)",
+        MAP_DIR / "pv_detection_rate_choropleth.png",
+        cmap="YlOrBr",
+    )
+    plot_choropleth(
+        bg_gdf, "annual_flux_mean_kwh_per_kw_yr",
+        "Google annual rooftop flux mean (kWh/kW/yr)",
+        MAP_DIR / "annual_flux_choropleth.png",
+        cmap="plasma",
+    )
+    if "nsrdb_ghi_mean" in bg_gdf.columns and bg_gdf["nsrdb_ghi_mean"].notna().any():
+        plot_choropleth(
+            bg_gdf, "nsrdb_ghi_mean",
+            "NSRDB multiyear GHI mean (W/m2)",
+            MAP_DIR / "nsrdb_ghi_choropleth.png",
+            cmap="cividis",
+        )
+    plot_choropleth(
+        bg_gdf, "median_household_income_usd",
+        "ACS median household income (USD)",
+        MAP_DIR / "acs_income_choropleth.png",
+        cmap="viridis",
+    )
+    plot_choropleth(
+        bg_gdf, "pct_bachelor_plus",
+        "Share age 25+ with Bachelor's or higher",
+        MAP_DIR / "acs_education_choropleth.png",
+        cmap="BuGn",
+    )
+    plot_choropleth(
+        bg_gdf, "diversity_index",
+        "Census 2020 Diversity Index (from ACS B03002)",
+        MAP_DIR / "acs_diversity_index_choropleth.png",
+        cmap="magma",
+    )
+    if "is_urban" in bg_gdf.columns and bg_gdf["is_urban"].notna().any():
+        fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+        for ax, muni in zip(axes, TARGET_MUNICIPALITIES):
+            subset = bg_gdf[bg_gdf["municipio"] == muni]
+            if subset.empty:
+                ax.set_title(f"{muni}: no data")
+                ax.set_axis_off()
+                continue
+            subset.assign(is_urban_int=subset["is_urban"].astype(int)).plot(
+                column="is_urban_int", ax=ax, cmap="coolwarm",
+                categorical=True, legend=True, edgecolor="#555", linewidth=0.2,
+            )
+            ax.set_title(f"{muni} — urban (2020) vs. rural BGs")
+            ax.set_axis_off()
+        fig.tight_layout()
+        out = MAP_DIR / "urban_rural_2020_choropleth.png"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out, dpi=140, bbox_inches="tight")
+        plt.close(fig)
+        print(f"wrote {out}")
 
-con.close()
+    # %%
+    print("[6/6] Moran's I on BG PV signal rates …")
+    try:
+        from libpysal.weights import Queen
+        from esda.moran import Moran
+
+        mo_rows = []
+        for metric_name in ("any_pv_signal_rate", "detected_pv_rate"):
+            for muni in TARGET_MUNICIPALITIES:
+                subset = bg_gdf[(bg_gdf["municipio"] == muni) & bg_gdf[metric_name].notna()].copy()
+                if len(subset) < 5:
+                    continue
+                w = Queen.from_dataframe(subset, use_index=False)
+                w.transform = "r"
+                moran = Moran(subset[metric_name].values, w, permutations=999)
+                mo_rows.append({
+                    "metric": metric_name,
+                    "municipio": muni,
+                    "n_bgs": len(subset),
+                    "morans_I": moran.I,
+                    "p_sim": moran.p_sim,
+                    "z_sim": moran.z_sim,
+                })
+        if mo_rows:
+            mo_df = pd.DataFrame(mo_rows)
+            mo_out = FIG_DIR / "pv_bg_morans_i.csv"
+            mo_df.to_csv(mo_out, index=False)
+            print(mo_df.to_string(index=False))
+            print(f"      wrote {mo_out}")
+    except Exception as exc:
+        print(f"Moran's I step skipped: {exc}")
+
+    con.close()

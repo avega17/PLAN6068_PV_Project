@@ -89,6 +89,7 @@ OVERTURE_WORKING_DIR = PROJECT_ROOT / "cache" / "overture_tmp"
 OVERTURE_FETCH_BACKEND = os.getenv("OVERTURE_FETCH_BACKEND", "official_island_bbox").strip().lower()
 OVERTURE_REFRESH_GEOPARQUET_CACHE = os.getenv("OVERTURE_REFRESH_GEOPARQUET_CACHE", "0") == "1"
 CLEAN_LEGACY_OVERTURE_ARTIFACTS = os.getenv("CLEAN_LEGACY_OVERTURE_ARTIFACTS", "1") == "1"
+ALLOW_OFFICIAL_ISLAND_BBOX_MAESTRO_FALLBACK = os.getenv("OVERTURE_ALLOW_OFFICIAL_FALLBACK", "1") == "1"
 TOP_K_MUNICIPALITIES = 10
 OVERTURE_FETCH_STRATEGY = "single_union"
 OVERTURE_DOWNLOAD_MAX_WORKERS: int | None = 8
@@ -770,8 +771,76 @@ def fetch_official_overture_buildings_table_for_bbox(
         release=release,
     )
     if reader is None:
-        raise RuntimeError("overturemaps.record_batch_reader returned None for the requested bbox.")
+        raise RuntimeError(
+            "overturemaps.record_batch_reader returned None for the requested bbox. "
+            f"release={release!r}, bbox={bbox!r}."
+        )
     return reader.read_all()
+
+
+def export_island_geometry_geoparquet_with_maestro_fallback(
+    municipalities_gdf: gpd.GeoDataFrame,
+    output_path: Path,
+    *,
+    compression: str = ISLAND_BBOX_EXPORT_COMPRESSION,
+    failure_reason: str | None = None,
+) -> dict[str, object]:
+    """Build the whole-island cache through OvertureMaestro when the official client path is unavailable."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    island_bbox = compute_island_bbox_from_municipalities(municipalities_gdf)
+    island_geometry = build_union_geometry(municipalities_gdf)
+
+    total_started = time.perf_counter()
+    fetch_started = time.perf_counter()
+    OVERTURE_WORKING_DIR.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix="overture_island_fallback_", dir=str(OVERTURE_WORKING_DIR)))
+    try:
+        fetched_gdf, parquet_paths = fetch_overture_buildings(
+            island_geometry,
+            temp_dir,
+            strategy="single_union",
+            columns_to_download=OVERTURE_COLUMNS_TO_DOWNLOAD,
+            max_workers=OVERTURE_DOWNLOAD_MAX_WORKERS,
+        )
+        fetch_elapsed_seconds = time.perf_counter() - fetch_started
+
+        assignment_started = time.perf_counter()
+        assigned_gdf = assign_buildings_to_municipalities(fetched_gdf, municipalities_gdf)
+        assigned_gdf.to_parquet(output_path, compression=compression, index=False)
+        assignment_elapsed_seconds = time.perf_counter() - assignment_started
+        total_elapsed_seconds = time.perf_counter() - total_started
+
+        raw_snapshot_size_bytes = int(sum(path.stat().st_size for path in parquet_paths if path.exists()))
+        output_size_bytes = output_path.stat().st_size
+        municipio_counts = (
+            assigned_gdf["municipality_name"]
+            .fillna("UNASSIGNED")
+            .value_counts()
+            .rename_axis("municipality_name")
+            .reset_index(name="building_rows")
+            .head(20)
+        )
+        assigned_row_count = int(assigned_gdf["municipality_name"].notna().sum())
+
+        return {
+            "release": OVERTURE_RELEASE,
+            "bbox": island_bbox,
+            "output_path": str(output_path),
+            "rows_total": int(len(assigned_gdf)),
+            "rows_assigned": assigned_row_count,
+            "rows_unassigned": int(len(assigned_gdf)) - assigned_row_count,
+            "fetch_elapsed_seconds": round(fetch_elapsed_seconds, 2),
+            "assignment_elapsed_seconds": round(assignment_elapsed_seconds, 2),
+            "total_elapsed_seconds": round(total_elapsed_seconds, 2),
+            "raw_snapshot_size_bytes": raw_snapshot_size_bytes,
+            "output_size_bytes": int(output_size_bytes),
+            "municipality_preview": municipio_counts,
+            "backend_used": "maestro_geometry_fallback",
+            "fallback_reason": failure_reason,
+        }
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def export_official_island_bbox_geoparquet_with_sql_assignment(
@@ -997,13 +1066,28 @@ def build_or_load_official_island_bbox_geoparquet(
         cached_gdf = load_overture_cache_geodataframe(output_path)
         return cached_gdf, summarize_overture_cache(output_path, cached_gdf, release=release)
 
-    stats = export_official_island_bbox_geoparquet_with_sql_assignment(
-        con,
-        municipalities_gdf=municipalities_gdf,
-        output_path=output_path,
-        release=release,
-        compression=compression,
-    )
+    try:
+        stats = export_official_island_bbox_geoparquet_with_sql_assignment(
+            con,
+            municipalities_gdf=municipalities_gdf,
+            output_path=output_path,
+            release=release,
+            compression=compression,
+        )
+        stats["backend_used"] = "official_island_bbox"
+    except Exception as exc:
+        if not ALLOW_OFFICIAL_ISLAND_BBOX_MAESTRO_FALLBACK:
+            raise
+        print(
+            "[warn] official island-bbox Overture fetch failed; "
+            f"falling back to Maestro geometry export. reason: {exc}"
+        )
+        stats = export_island_geometry_geoparquet_with_maestro_fallback(
+            municipalities_gdf,
+            output_path,
+            compression=compression,
+            failure_reason=str(exc),
+        )
     stats["used_cache"] = False
     refreshed_gdf = load_overture_cache_geodataframe(output_path)
     return refreshed_gdf, stats

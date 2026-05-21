@@ -1,0 +1,11 @@
+dataset,status,evidence,notes
+Case-study municipality polygons,ready,"pr_census_counties: Isabela: 1, San Juan: 1",Target municipality boundaries are the geometry anchor for the BG core.
+Census block-group geometries,ready,"pr_census_block_groups: Isabela: 29, San Juan: 362",This is the frozen core analysis unit for ESDA and correlations.
+ACS 2024 5-year block-group attributes,ready,"table=False (pr_acs_2024_block_groups), artifact=True (data/tabular/acs_2024_5yr_block_groups.parquet)",Ready via local parquet fallback even though the DuckDB table is not currently materialized.
+Urban context flags,ready,"pr_bg_urban_flags: 2,513 rows",Block-group urban context is materialized and joinable now.
+Overture buildings,ready,"pr_overture_buildings: Isabela: 38,969, San Juan: 126,088",Building footprints are present and scoped to the case-study municipalities.
+OSM rooftop PV polygons,ready,"pr_osm_rooftop_pv_polygons: Isabela: 1,474, San Juan: 9,938",Usable as the conservative fallback PV signal once joined back to buildings and BGs.
+GeoAI PV detections,partial,"pr_solar_pv_detections: total rows=1, by target=n/a",Detections exist but are too sparse for the core narrative; retain as sensitivity only.
+Building-level PV + annual-flux join,partial,pr_buildings_with_pv: materialized=True,"This is the immediate gate. The join table is missing, so BG PV and flux outcomes are not audit-ready yet."
+Block-group aggregate surface,partial,pr_pv_bg_aggregates: materialized=True,"Core ESDA should remain BG-based, but the aggregate must be rebuilt before maps, correlations, or Moran diagnostics can run."
+NSRDB multiyear add-on,partial,"normalized parquet files: nsrdb_site_6393384_2018_30min.parquet, nsrdb_site_6393384_2019_30min.parquet, nsrdb_site_6393384_2020_30min.parquet, nsrdb_site_6393384_2021_30min.parquet, nsrdb_site_6393384_2022_30min.parquet",Keep NSRDB outside the core ESDA gate until the BG join path is restored; use it later as a comparison branch.

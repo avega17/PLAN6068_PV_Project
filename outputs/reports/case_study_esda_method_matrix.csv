@@ -1,0 +1,10 @@
+method_family,method,status,implementation_notes,suggested_modules
+Core,Fixed-classification municipality choropleths,recommended,Use shared breaks across San Juan and Isabela; keep municipality small multiples instead of pooling the disconnected geography.,"geopandas.plot, mapclassify"
+Core,Pearson / Spearman matrix and targeted scatterplots,recommended,Use BG-level outcomes plus ACS and urban covariates once the aggregate exists.,"pandas, scipy.stats, seaborn"
+Core,"Queen weights, Moran scatter, global Moran's I",recommended,Run primarily per municipality; pooled results are descriptive only.,"libpysal.weights.Queen, esda.moran.Moran"
+Core,Local Moran / LISA,recommended,Produce one main PV-outcome LISA map and one optional contextual map once the BG outcome is defensible.,esda.moran.Moran_Local
+Sensitivity,Queen-versus-Rook weights check,recommended,Retain only if the main spatial interpretation changes materially.,"libpysal.weights.Queen, libpysal.weights.Rook"
+Appendix,Correlogram or one focused bivariate/partial Moran question,optional,Only after the core ESDA tables and maps land cleanly.,"libpysal, esda"
+Appendix,DBSCAN on NSRDB or other point surfaces,optional,"Keep off the BG core. If used, treat it as a separate point-based appendix rather than a BG clustering result.",sklearn.cluster.DBSCAN
+Excluded from 3-day core,Point-pattern methods or DBSCAN on BG centroids,exclude,Not aligned with the frozen BG analysis unit for the core deliverable.,n/a
+Excluded from 3-day core,"Full spatial econometrics, GWR, predictive ML",exclude,Too far beyond the current data readiness and timeline.,n/a

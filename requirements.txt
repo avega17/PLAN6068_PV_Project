@@ -42,6 +42,7 @@ duckdb-engine
 # opencv-python
 scikit-learn
 geoai-py
+segment-geospatial[samgeo3]
 # torch>=2.12
 
 # Geospatial data/API access
@@ -86,3 +87,4 @@ esda
 # Utilities
 python-dotenv
 tqdm
+termcolor

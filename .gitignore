@@ -3,6 +3,7 @@ notebooks/**/cache
 data/**/cache/*
 data/**/*.parquet
 data/rasters/*
+data/tabular/nsrdb/*
 cache/*
 outputs/geoparquet/*
 outputs/figures/review
@@ -11,6 +12,8 @@ outputs/geoai_*/*
 # still WIP and way too large
 outputs/maps/pr_urban_all_geographies_preview.html
 outputs/models/*
+outputs/sam_*
+outputs/stac_tiles/*
 **/overture_bounding_boxes/
 
 **/*.cpython-*

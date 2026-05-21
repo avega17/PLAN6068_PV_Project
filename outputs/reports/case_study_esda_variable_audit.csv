@@ -1,0 +1,11 @@
+variable,status,recommended_role,notes
+detected_pv_count,partial,Sensitivity only,Blocked by missing building join and materially weakened by sparse detections.
+detected_pv_rate,partial,Sensitivity only,Same dependency as detected_pv_count; do not use as the lead outcome until the join is rebuilt and zero-inflation is checked.
+osm_pv_count / overlap_count fallback,partial,Preferred conservative PV outcome,"OSM polygons are present now, but the building and BG joins still need to be materialized."
+annual_flux_mean_kwh_per_kw_yr,partial,Core covariate once join is rebuilt,Blocked on the missing building-level join; do not claim BG-level flux readiness yet.
+flux_pixel_count,partial,Coverage QC metric,Needed to assess flux coverage defensibility after the join is rebuilt.
+median_household_income_usd,ready,Core contextual covariate,Available via the ACS 2024 parquet fallback and ready to join into the BG aggregate.
+pct_bachelor_plus,ready,Core contextual covariate,Derived directly from the ACS 2024 block-group slice.
+pct_owner_occupied,ready,Core contextual covariate,Derived directly from the ACS 2024 block-group slice.
+diversity_index,ready,Core contextual covariate,Derivable now from ACS B03002 once the BG aggregate is rebuilt.
+is_urban / pct_urban_population,ready,Core contextual covariate,Materialized in pr_bg_urban_flags and ready for the BG join.

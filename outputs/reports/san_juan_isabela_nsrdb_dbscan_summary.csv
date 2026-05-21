@@ -1,0 +1,2 @@
+municipio,cluster_id,cluster_label,is_noise,site_count,dbscan_eps,dbscan_min_samples,mean_ghi,mean_dni,mean_dhi,mean_air_temperature,mean_clearsky_ghi,mean_clearsky_dni,mean_clearsky_dhi,mean_surface_albedo
+Isabela,-1,noise,True,8,,10,238.80839207349513,255.25199010877276,68.14590484745437,27.545224561580564,281.7888590690599,343.034296164593,52.78411286788557,0.1778371536577802
