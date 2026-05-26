@@ -1,0 +1,5 @@
+metric,municipio,weights,n_tracts,morans_I,p_sim,z_sim
+any_pv_evidence_buildings_per_1000,Isabela,queen,11,-0.08950362729386845,0.466,0.046905010281608386
+any_pv_evidence_buildings_per_1000,San Juan,queen,137,0.4101817791598392,0.001,7.810636770999292
+any_pv_evidence_buildings_per_1000,Isabela,rook,11,-0.08950362729386845,0.452,0.046537490152287184
+any_pv_evidence_buildings_per_1000,San Juan,rook,137,0.4256054116061946,0.001,7.905931934115793

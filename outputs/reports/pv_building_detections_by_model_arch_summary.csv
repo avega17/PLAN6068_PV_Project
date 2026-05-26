@@ -1,0 +1,13 @@
+municipio,model_arch_display,detected_buildings,total_detection_polygons
+Isabela,Shared,2091,11072
+Isabela,DINOv3,1541,2111
+Isabela,PAN,441,501
+Isabela,DeepLabV3+,281,386
+Isabela,Segformer,169,222
+Isabela,FPN,89,124
+San Juan,Shared,8715,65562
+San Juan,DINOv3,5269,8175
+San Juan,DeepLabV3+,4004,6205
+San Juan,PAN,2225,3560
+San Juan,FPN,528,726
+San Juan,Segformer,177,223

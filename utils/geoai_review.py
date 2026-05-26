@@ -24,6 +24,10 @@ def _prepare_image_for_plot(image: np.ndarray) -> np.ndarray:
     return display
 
 
+def _blank_image_like(image: np.ndarray) -> np.ndarray:
+    return np.zeros_like(image, dtype=np.float32)
+
+
 def _read_image(image_path: Path) -> tuple[np.ndarray, tuple[float, float, float, float]]:
     with rasterio.open(image_path) as src:
         image = src.read()
@@ -41,30 +45,75 @@ def render_prediction_review_bundle(
     *,
     image_path: Path,
     output_stem: Path,
+    transformed_image_path: Path | None = None,
+    transformed_mask_path: Path | None = None,
     predicted_mask_path: Path | None = None,
     raw_mask_path: Path | None = None,
     grounded_mask_path: Path | None = None,
     vector_path: Path | None = None,
+    vector_gdf: gpd.GeoDataFrame | None = None,
     suptitle: str | None = None,
 ) -> dict[str, Path]:
     output_stem.parent.mkdir(parents=True, exist_ok=True)
     image, extent = _read_image(image_path)
+    transformed_image = None
+    transformed_extent = extent
+    if transformed_image_path is not None and transformed_image_path.exists():
+        transformed_image, transformed_extent = _read_image(transformed_image_path)
 
-    panels: list[tuple[str, np.ndarray | None, str | None]] = [("Source raster", None, None)]
+    panels: list[tuple[str, np.ndarray, tuple[float, float, float, float], np.ndarray | None, str | None]] = [
+        ("Source raster", image, extent, None, None)
+    ]
+    if transformed_image is not None:
+        panels.append(("Inference input", transformed_image, transformed_extent, None, None))
+    if transformed_mask_path is not None and transformed_mask_path.exists():
+        panels.append(
+            (
+                "Building clip mask",
+                _blank_image_like(transformed_image) if transformed_image is not None else _blank_image_like(image),
+                transformed_extent if transformed_image is not None else extent,
+                _read_mask(transformed_mask_path),
+                "Greys",
+            )
+        )
     if raw_mask_path is not None and raw_mask_path.exists():
-        panels.append(("Raw label", _read_mask(raw_mask_path), "Reds"))
+        panels.append(
+            (
+                "Raw label",
+                transformed_image if transformed_image is not None else image,
+                transformed_extent if transformed_image is not None else extent,
+                _read_mask(raw_mask_path),
+                "Reds",
+            )
+        )
     if grounded_mask_path is not None and grounded_mask_path.exists():
-        panels.append(("Grounded label", _read_mask(grounded_mask_path), "Greens"))
+        panels.append(
+            (
+                "Grounded label",
+                transformed_image if transformed_image is not None else image,
+                transformed_extent if transformed_image is not None else extent,
+                _read_mask(grounded_mask_path),
+                "Greens",
+            )
+        )
     if predicted_mask_path is not None and predicted_mask_path.exists():
-        panels.append(("Predicted mask", _read_mask(predicted_mask_path), "Blues"))
+        panels.append(
+            (
+                "Predicted mask",
+                _blank_image_like(transformed_image) if transformed_image is not None else _blank_image_like(image),
+                transformed_extent if transformed_image is not None else extent,
+                _read_mask(predicted_mask_path),
+                "Blues",
+            )
+        )
 
     review_png = output_stem.with_name(f"{output_stem.name}_review.png")
     fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 5), squeeze=False)
-    for ax, (title, mask, cmap) in zip(axes[0], panels):
-        ax.imshow(image, extent=extent)
+    for ax, (title, panel_image, panel_extent, mask, cmap) in zip(axes[0], panels):
+        ax.imshow(panel_image, extent=panel_extent)
         if mask is not None:
             overlay = np.ma.masked_where(mask <= 0, mask)
-            ax.imshow(overlay, extent=extent, cmap=cmap, alpha=0.35, vmin=0, vmax=max(1, int(mask.max())))
+            ax.imshow(overlay, extent=panel_extent, cmap=cmap, alpha=0.35, vmin=0, vmax=max(1, int(mask.max())))
         ax.set_title(title)
         ax.set_axis_off()
     title = suptitle or image_path.stem
@@ -74,25 +123,28 @@ def render_prediction_review_bundle(
     plt.close(fig)
 
     outputs = {"review_png_path": review_png}
-    if vector_path is not None and vector_path.exists():
+    vectors = vector_gdf
+    if vectors is None and vector_path is not None and vector_path.exists():
         try:
             vectors = gpd.read_file(vector_path)
         except Exception:
             vectors = None
-        if vectors is not None and not vectors.empty:
-            vector_png = output_stem.with_name(f"{output_stem.name}_vector_review.png")
-            fig, ax = plt.subplots(1, 1, figsize=(6, 6))
-            ax.imshow(image, extent=extent)
-            vectors.plot(
-                ax=ax,
-                facecolor=(1.0, 0.2, 0.2, 0.25),
-                edgecolor=(1.0, 1.0, 1.0, 0.9),
-                linewidth=0.8,
-            )
-            ax.set_title("Prediction polygons")
-            ax.set_axis_off()
-            fig.tight_layout()
-            fig.savefig(vector_png, dpi=200, bbox_inches="tight")
-            plt.close(fig)
-            outputs["vector_review_png_path"] = vector_png
+    if vectors is not None and not vectors.empty:
+        vector_png = output_stem.with_name(f"{output_stem.name}_vector_review.png")
+        fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+        background_image = transformed_image if transformed_image is not None else image
+        background_extent = transformed_extent if transformed_image is not None else extent
+        ax.imshow(background_image, extent=background_extent)
+        vectors.plot(
+            ax=ax,
+            facecolor=(1.0, 0.2, 0.2, 0.25),
+            edgecolor=(1.0, 1.0, 1.0, 0.9),
+            linewidth=0.8,
+        )
+        ax.set_title("Prediction polygons")
+        ax.set_axis_off()
+        fig.tight_layout()
+        fig.savefig(vector_png, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        outputs["vector_review_png_path"] = vector_png
     return outputs

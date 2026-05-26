@@ -1,16 +1,16 @@
 # %% [markdown]
 # # GeoAI Training Data Preparation
 # 
-# Builds a clean training dataset from Contextily/Esri WorldImagery chips
-# aligned to occupied H3 cells that already contain OSM rooftop PV labels.
-# The exporter now writes both the original raw OSM masks and a second
-# footprint-grounded mask variant clipped to matched Overture buildings, plus
-# per-tile prompt JSON artifacts for downstream SAM benchmarking.
+# Builds a clean training dataset from either Contextily/Esri WorldImagery or
+# local NAIP STAC chips aligned to occupied H3 cells that already contain OSM
+# rooftop PV labels. The exporter writes both the original raw OSM masks and a
+# second footprint-grounded mask variant clipped to matched Overture buildings,
+# plus per-tile prompt JSON artifacts for downstream benchmarking.
 
 # %%
 """09_geoai_training_data.py
 
-Export matched Contextily image/mask chips for GeoAI model training.
+Export matched ESRI or NAIP image/mask chips for GeoAI model training.
 """
 
 from __future__ import annotations
@@ -36,9 +36,15 @@ from rasterio.enums import Resampling
 from rasterio.features import rasterize
 from rasterio.transform import from_bounds
 from rasterio.warp import reproject
-from shapely import from_wkb
-from shapely.geometry import box
-from shapely.ops import unary_union
+from shapely import from_wkb, union_all
+from shapely.geometry import box, shape
+
+try:
+    import ipywidgets as widgets
+    from IPython.display import display
+except Exception:
+    widgets = None
+    display = None
 
 
 def resolve_project_root(start: Path | None = None) -> Path:
@@ -54,14 +60,37 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(PROJECT_ROOT / ".env")
 
+from utils.geoai_preview_sources import collect_naip_stac_preview_rasters, infer_stac_source_name
 from utils.overture import DEFAULT_OVERTURE_BUILDINGS_TABLE
+from utils.census import CANONICAL_COUNTY_TABLE
+from utils.raster_stac_index import resolve_vector_db_path
 
 OUTPUT_CRS = "EPSG:4326"
 MODEL_CRS = "EPSG:3857"
 MANIFEST_TABLE = "pr_solar_tile_manifest"
 PV_TABLE = "pr_osm_rooftop_pv_polygons"
 OVERTURE_BUILDINGS_TABLE = DEFAULT_OVERTURE_BUILDINGS_TABLE
-DEFAULT_TRAIN_ROOT = PROJECT_ROOT / "outputs" / "geoai_train_contextily"
+NAIP_SOURCE_NAMES = ("pr_naip", "naip_2021_pr")
+ESRI_CONTEXTILY_SOURCE = ctx.providers.Esri.WorldImagery
+STAC_TILE_MANIFEST = PROJECT_ROOT / "outputs" / "stac_tiles" / "pr_stac_tile_manifest.parquet"
+MAP_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "maps"
+VALID_IMAGERY_SOURCES = {"esri", "naip"}
+VALID_DATASET_COHORTS = {"train_pool", "holdout_priority3", "priority_band"}
+NOTEBOOK_DATASET_COHORTS = ("train_pool", "holdout_priority3")
+HOLDOUT_GROUP_LABEL = "priority3_seed_neighborhoods"
+SEED_NEIGHBORHOODS = (
+    {"seed_name": "Puerto Nuevo", "municipio": "San Juan", "cache_name": "Puerto Nuevo", "osm_query": "Puerto Nuevo, San Juan, Puerto Rico"},
+    {"seed_name": "Mora", "municipio": "Isabela", "cache_name": "Mora", "osm_query": "Mora, Isabela, Puerto Rico"},
+)
+IMAGERY_SOURCE_LABELS = {
+    "esri": "Esri WorldImagery",
+    "naip": "Local NAIP STAC",
+}
+DATASET_COHORT_LABELS = {
+    "train_pool": "Train/val/test pool with seed-neighborhood test tiles",
+    "holdout_priority3": "Seed-neighborhood holdout only",
+    "priority_band": "Priority band export",
+}
 
 
 def _resolve_configured_path(env_name: str, default: Path) -> Path:
@@ -72,17 +101,46 @@ def _resolve_configured_path(env_name: str, default: Path) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
+def _normalize_choice(value: str, *, name: str, valid_values: set[str]) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized not in valid_values:
+        allowed = ", ".join(sorted(valid_values))
+        raise ValueError(f"{name} must be one of: {allowed}. Received: {value!r}")
+    return normalized
+
+
+def _default_train_root(imagery_source: str, dataset_cohort: str) -> Path:
+    imagery_source = _normalize_choice(imagery_source, name="imagery_source", valid_values=VALID_IMAGERY_SOURCES)
+    dataset_cohort = _normalize_choice(dataset_cohort, name="dataset_cohort", valid_values=VALID_DATASET_COHORTS)
+    imagery_slug = "contextily" if imagery_source == "esri" else imagery_source
+    if dataset_cohort == "train_pool":
+        return PROJECT_ROOT / f"outputs/geoai_train_{imagery_slug}"
+    if dataset_cohort == "holdout_priority3":
+        return PROJECT_ROOT / f"outputs/geoai_holdout_{imagery_slug}_priority3"
+    return PROJECT_ROOT / f"outputs/geoai_{imagery_slug}_priority_band"
+
+
+IMAGERY_SOURCE = _normalize_choice(
+    os.getenv("GEOAI_IMAGERY_SOURCE", "esri"),
+    name="GEOAI_IMAGERY_SOURCE",
+    valid_values=VALID_IMAGERY_SOURCES,
+)
+DATASET_COHORT = _normalize_choice(
+    os.getenv("GEOAI_DATASET_COHORT", "train_pool"),
+    name="GEOAI_DATASET_COHORT",
+    valid_values=set(NOTEBOOK_DATASET_COHORTS),
+)
+SPLIT_POLICY = (os.getenv("GEOAI_SPLIT_POLICY", "priority3_holdout") or "priority3_holdout").strip().lower()
+HOLDOUT_PRIORITY_SCORE = int(os.getenv("GEOAI_HOLDOUT_PRIORITY_SCORE", "3") or "3")
+ENABLE_WIDGETS = os.getenv("GEOAI_ENABLE_WIDGETS", "1") == "1"
+
+
+DEFAULT_TRAIN_ROOT = _default_train_root(IMAGERY_SOURCE, DATASET_COHORT)
+
+
 TRAIN_ROOT = _resolve_configured_path("GEOAI_TRAIN_ROOT", DEFAULT_TRAIN_ROOT)
-TRAIN_IMAGE_DIR = TRAIN_ROOT / "images"
-TRAIN_MASK_DIR = TRAIN_ROOT / "masks"
-TRAIN_GROUNDED_MASK_DIR = TRAIN_ROOT / "grounded_masks"
-TRAIN_PROMPT_DIR = TRAIN_ROOT / "prompt_artifacts"
-TRAIN_REVIEW_DIR = TRAIN_ROOT / "review_artifacts"
-TRAIN_MANIFEST = TRAIN_ROOT / "training_chip_manifest.csv"
-TRAIN_SUMMARY = TRAIN_ROOT / "training_chip_summary.json"
 PRIORITY2_TRAIN_ROOT = _resolve_configured_path("GEOAI_PRIORITY2_TRAIN_ROOT", PROJECT_ROOT / "outputs" / "geoai_train_contextily_priority")
 PRIORITY1_TRAIN_ROOT = _resolve_configured_path("GEOAI_PRIORITY1_TRAIN_ROOT", PROJECT_ROOT / "outputs" / "geoai_train_contextily_priority")
-TRAIN_SOURCE = ctx.providers.Esri.WorldImagery
 
 CHIP_PIXELS = int(os.getenv("GEOAI_CHIP_PIXELS", "512"))
 CHIP_PADDING_FACTOR = float(os.getenv("GEOAI_CHIP_PADDING_FACTOR", "1.15"))
@@ -92,12 +150,15 @@ CONTEXTILY_USE_CACHE = os.getenv("GEOAI_CONTEXTILY_USE_CACHE", "1") == "1"
 RESET_TRAIN_ROOT = os.getenv("GEOAI_RESET_TRAIN_ROOT", "0") == "1"
 RESET_PRIORITY_BAND_ROOTS = os.getenv("GEOAI_RESET_PRIORITY_BAND_ROOTS", "0") == "1"
 OVERWRITE_EXISTING_CHIPS = os.getenv("GEOAI_OVERWRITE_EXISTING_CHIPS", "0") == "1"
+REPAIR_EXISTING_SPLITS_ONLY = os.getenv("GEOAI_REPAIR_EXISTING_SPLITS_ONLY", "0") == "1"
+REFETCH_PRIORITY_SEED_MISMATCHES_ONLY = os.getenv("GEOAI_REFETCH_PRIORITY_SEED_MISMATCHES_ONLY", "0") == "1"
 MAX_TILES = int(os.getenv("GEOAI_MAX_TILES", "0") or "0")
 MAX_TILES_PER_MUNICIPALITY = int(os.getenv("GEOAI_MAX_TILES_PER_MUNICIPALITY", "0") or "0")
-MIN_PRIORITY_SCORE = int(os.getenv("GEOAI_MIN_PRIORITY_SCORE", "3") or "3")
+MIN_PRIORITY_SCORE = int(os.getenv("GEOAI_MIN_PRIORITY_SCORE", "1") or "1")
 MAX_PRIORITY_SCORE = int(os.getenv("GEOAI_MAX_PRIORITY_SCORE", "0") or "0") or None
 PREVIEW_SAMPLE_COUNT = int(os.getenv("GEOAI_PREVIEW_SAMPLE_COUNT", "6") or "6")
 PREVIEW_OVERLAY_ALPHA = float(os.getenv("GEOAI_PREVIEW_OVERLAY_ALPHA", "0.30") or "0.30")
+MIN_VALIDATION_SHARE = float(os.getenv("GEOAI_MIN_VALIDATION_SHARE", "0.10") or "0.10")
 SHOW_PREVIEW = os.getenv("GEOAI_SHOW_PREVIEW", "1") == "1"
 WRITE_REVIEW_ARTIFACTS = os.getenv("GEOAI_WRITE_REVIEW_ARTIFACTS", "1") == "1"
 EXPORT_PRIORITY2_VALIDATION = os.getenv("GEOAI_EXPORT_PRIORITY2_VALIDATION", "0") == "1"
@@ -124,11 +185,40 @@ def _parse_csv_env(env_name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     value = os.getenv(env_name)
     if not value:
         return default
-    parts = tuple(part.strip() for part in value.split(",") if part.strip())
+    cleaned = value.strip()
+    if len(cleaned) >= 2 and cleaned[0] in "([{" and cleaned[-1] in ")]}":
+        cleaned = cleaned[1:-1]
+
+    parts: list[str] = []
+    for raw_part in cleaned.split(","):
+        part = raw_part.strip().strip("\"'").strip()
+        part = part.strip("()[]{}")
+        if part:
+            parts.append(part)
+
+    parsed = tuple(parts)
+    if parsed and parsed != tuple(default):
+        if any(token != token.strip("\"'").strip() for token in parsed):
+            print(f"note: normalized {env_name} tokens to {parsed}")
+    parts = parsed
     return parts or default
 
 
-TARGET_MUNICIPALITIES = _parse_csv_env("GEOAI_TARGET_MUNICIPALITIES", ("San Juan", "Isabela"))
+CASE_STUDY_MUNICIPALITIES = _parse_csv_env(
+    "GEOAI_CASE_STUDY_MUNICIPALITIES",
+    ("San Juan", "Isabela"),
+)
+
+
+# Empty means "all municipalities". Set GEOAI_TARGET_MUNICIPALITIES to a
+# comma-separated subset (or tuple-style string) when you want a scoped export.
+_TARGET_MUNICIPALITIES_RAW = (os.getenv("GEOAI_TARGET_MUNICIPALITIES", "") or "").strip()
+if _TARGET_MUNICIPALITIES_RAW.lower() in {"", "all", "*"}:
+    TARGET_MUNICIPALITIES: tuple[str, ...] = tuple()
+else:
+    TARGET_MUNICIPALITIES = _parse_csv_env("GEOAI_TARGET_MUNICIPALITIES", tuple())
+
+_TRAINING_WIDGETS: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -156,14 +246,62 @@ def resolve_training_layout(train_root: Path) -> TrainingLayout:
     )
 
 
+def _widgets_enabled() -> bool:
+    return ENABLE_WIDGETS and widgets is not None and display is not None and "ipykernel" in sys.modules
+
+
+def _maybe_initialize_training_widgets() -> None:
+    global _TRAINING_WIDGETS
+    if _TRAINING_WIDGETS is not None or not _widgets_enabled():
+        return
+
+    imagery_widget = widgets.Dropdown(
+        options=[(IMAGERY_SOURCE_LABELS[key], key) for key in sorted(VALID_IMAGERY_SOURCES)],
+        value=IMAGERY_SOURCE,
+        description="Imagery",
+        layout=widgets.Layout(width="320px"),
+    )
+    cohort_widget = widgets.Dropdown(
+        options=[(DATASET_COHORT_LABELS[key], key) for key in NOTEBOOK_DATASET_COHORTS],
+        value=DATASET_COHORT,
+        description="Cohort",
+        layout=widgets.Layout(width="420px"),
+    )
+    help_text = widgets.HTML(
+        value=(
+            "<b>Export controls</b><br>"
+            "Use ESRI or NAIP imagery for the same chip contract. "
+            "The train pool keeps seed-neighborhood tiles as the test split, while the holdout cohort exports only those seed tiles."
+        )
+    )
+    display(widgets.VBox([help_text, widgets.HBox([imagery_widget, cohort_widget])]))
+    _TRAINING_WIDGETS = {
+        "imagery_source": imagery_widget,
+        "dataset_cohort": cohort_widget,
+    }
+
+
+def apply_training_widget_overrides() -> None:
+    global IMAGERY_SOURCE, DATASET_COHORT, TRAIN_ROOT
+    if not _TRAINING_WIDGETS:
+        return
+
+    IMAGERY_SOURCE = _normalize_choice(
+        str(_TRAINING_WIDGETS["imagery_source"].value),
+        name="imagery_source",
+        valid_values=VALID_IMAGERY_SOURCES,
+    )
+    DATASET_COHORT = _normalize_choice(
+        str(_TRAINING_WIDGETS["dataset_cohort"].value),
+        name="dataset_cohort",
+        valid_values=set(NOTEBOOK_DATASET_COHORTS),
+    )
+    if "GEOAI_TRAIN_ROOT" not in os.environ:
+        TRAIN_ROOT = _default_train_root(IMAGERY_SOURCE, DATASET_COHORT)
+
+
 def resolve_db_path() -> Path:
-    value = os.getenv("VECTOR_DB")
-    if value:
-        path = Path(value)
-        if not path.is_absolute():
-            path = PROJECT_ROOT / path if len(path.parts) > 1 else PROJECT_ROOT / "data" / "vectors" / path
-        return path
-    return PROJECT_ROOT / "data" / "PR_PV_plan_data.duckdb"
+    return resolve_vector_db_path()
 
 
 def connect(db_path: Path) -> duckdb.DuckDBPyConnection:
@@ -253,7 +391,14 @@ def load_training_cells(
     max_priority_score: int | None = MAX_PRIORITY_SCORE,
     max_tiles: int = MAX_TILES,
     max_tiles_per_municipality: int = MAX_TILES_PER_MUNICIPALITY,
+    dataset_cohort: str = DATASET_COHORT,
+    holdout_priority_score: int = HOLDOUT_PRIORITY_SCORE,
 ) -> gpd.GeoDataFrame:
+    dataset_cohort = _normalize_choice(
+        dataset_cohort,
+        name="dataset_cohort",
+        valid_values=VALID_DATASET_COHORTS,
+    )
     table_exists = con.execute(
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?;",
         [MANIFEST_TABLE],
@@ -264,7 +409,12 @@ def load_training_cells(
         )
 
     available_columns = _table_columns(con, MANIFEST_TABLE)
-    names_sql = ", ".join("?" * len(target_municipalities))
+    municipio_filter_sql = ""
+    params: list[object] = []
+    if target_municipalities:
+        names_sql = ", ".join("?" * len(target_municipalities))
+        municipio_filter_sql = f"\n          AND municipio IN ({names_sql})"
+        params.extend(target_municipalities)
     municipio_geoid_expr = _optional_cast_expr(
         available_columns,
         "municipio_geoid",
@@ -283,11 +433,12 @@ def load_training_cells(
         "INTEGER",
         fallback="CAST(NULL AS INTEGER)",
     )
-    priority_max_sql = ""
-    params: list[object] = [*target_municipalities, min_priority_score]
+    priority_filters: list[str] = ["COALESCE(priority_score, 0) >= ?"]
+    params.append(min_priority_score)
     if max_priority_score is not None:
-        priority_max_sql = "\n          AND COALESCE(priority_score, 0) <= ?"
+        priority_filters.append("COALESCE(priority_score, 0) <= ?")
         params.append(max_priority_score)
+    priority_sql = "" if not priority_filters else "\n          AND " + "\n          AND ".join(priority_filters)
     df = con.execute(
         f"""
         SELECT
@@ -304,10 +455,9 @@ def load_training_cells(
             ST_AsWKB(geometry) AS geometry_wkb
         FROM {MANIFEST_TABLE}
         WHERE geometry IS NOT NULL
-          AND municipio IN ({names_sql})
+                    {municipio_filter_sql}
           AND COALESCE(osm_pv_count, 0) > 0
-          AND COALESCE(priority_score, 0) >= ?
-          {priority_max_sql}
+                    {priority_sql}
         ORDER BY priority_score DESC, osm_pv_count DESC, building_count DESC, tile_id;
         """,
         params,
@@ -370,8 +520,12 @@ def load_overture_buildings(
             f"{OVERTURE_BUILDINGS_TABLE} not found; run notebooks/vectors/03_overture_buildings_ingest.py first."
         )
 
-    municipio_sql = ", ".join("?" * len(target_municipalities))
-    params: list[object] = [*target_municipalities]
+    params: list[object] = []
+    municipio_filter_sql = ""
+    if target_municipalities:
+        municipio_sql = ", ".join("?" * len(target_municipalities))
+        municipio_filter_sql = f"\n          AND municipality_name IN ({municipio_sql})"
+        params.extend(target_municipalities)
     h3_filter_sql = ""
     normalized_h3_ids = tuple(sorted({str(value) for value in (h3_cell_ids or ()) if value}))
     if normalized_h3_ids:
@@ -388,7 +542,7 @@ def load_overture_buildings(
             ST_AsWKB(geometry) AS geometry_wkb
         FROM {OVERTURE_BUILDINGS_TABLE}
         WHERE geometry IS NOT NULL
-                    AND municipality_name IN ({municipio_sql})
+                    {municipio_filter_sql}
           {h3_filter_sql}
         ORDER BY municipio, building_id;
         """,
@@ -405,9 +559,94 @@ def load_overture_buildings(
     return gpd.GeoDataFrame(df.drop(columns=["geometry_wkb"]), geometry=geometry, crs=OUTPUT_CRS)
 
 
-def assign_dataset_split(key: object) -> str:
+def load_municipality_boundaries(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame:
+    table_exists = con.execute(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?;",
+        [CANONICAL_COUNTY_TABLE],
+    ).fetchone()[0]
+    if not table_exists:
+        return gpd.GeoDataFrame(columns=["GEOID", "NAME", "geometry"], geometry="geometry", crs=OUTPUT_CRS)
+
+    df = con.execute(
+        f"""
+        SELECT
+            CAST(GEOID AS VARCHAR) AS geoid,
+            CAST(NAME AS VARCHAR) AS name,
+            ST_AsWKB(geometry) AS geometry_wkb
+        FROM {CANONICAL_COUNTY_TABLE}
+        WHERE geometry IS NOT NULL
+        ORDER BY name;
+        """
+    ).fetchdf()
+    if df.empty:
+        return gpd.GeoDataFrame(columns=["geoid", "name", "geometry"], geometry="geometry", crs=OUTPUT_CRS)
+
+    geometry = gpd.GeoSeries(df["geometry_wkb"].map(lambda value: from_wkb(_to_bytes(value))), crs=OUTPUT_CRS)
+    return gpd.GeoDataFrame(df.drop(columns=["geometry_wkb"]), geometry=geometry, crs=OUTPUT_CRS)
+
+
+def _seed_cache_directories() -> tuple[Path, ...]:
+    return (
+        PROJECT_ROOT / "cache",
+        PROJECT_ROOT / "notebooks" / "vectors" / "cache",
+    )
+
+
+def _load_cached_seed_geometry(seed_name: str, municipio: str):
+    for cache_dir in _seed_cache_directories():
+        if not cache_dir.exists():
+            continue
+        for path in sorted(cache_dir.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text())
+            except Exception:
+                continue
+            if not isinstance(payload, list):
+                continue
+            for record in payload:
+                if str(record.get("name") or "").strip() != seed_name:
+                    continue
+                display_name = str(record.get("display_name") or "")
+                if municipio not in display_name:
+                    continue
+                geojson = record.get("geojson")
+                if not isinstance(geojson, dict):
+                    continue
+                if str(geojson.get("type") or "") not in {"Polygon", "MultiPolygon"}:
+                    continue
+                return shape(geojson)
+    return None
+
+
+def load_seed_neighborhoods() -> gpd.GeoDataFrame:
+    rows: list[dict[str, object]] = []
+    missing: list[str] = []
+    for seed in SEED_NEIGHBORHOODS:
+        geometry = _load_cached_seed_geometry(str(seed["cache_name"]), str(seed["municipio"]))
+        if geometry is None:
+            missing.append(str(seed["seed_name"]))
+            continue
+        rows.append(
+            {
+                "seed_name": str(seed["seed_name"]),
+                "municipio": str(seed["municipio"]),
+                "geometry": geometry,
+            }
+        )
+    if missing:
+        print(f"[warn] missing cached seed neighborhood polygons: {', '.join(missing)}")
+    if not rows:
+        return gpd.GeoDataFrame(columns=["seed_name", "municipio", "geometry"], geometry="geometry", crs=OUTPUT_CRS)
+    return gpd.GeoDataFrame(rows, geometry="geometry", crs=OUTPUT_CRS)
+
+
+def _dataset_split_fraction(key: object) -> float:
     digest = hashlib.sha1(str(key).encode("utf-8")).hexdigest()
-    fraction = int(digest[:12], 16) / float((16**12) - 1)
+    return int(digest[:12], 16) / float((16**12) - 1)
+
+
+def assign_dataset_split(key: object) -> str:
+    fraction = _dataset_split_fraction(key)
     train_cutoff = TRAIN_SPLIT_WEIGHTS[0]
     val_cutoff = TRAIN_SPLIT_WEIGHTS[0] + TRAIN_SPLIT_WEIGHTS[1]
     if fraction < train_cutoff:
@@ -415,6 +654,400 @@ def assign_dataset_split(key: object) -> str:
     if fraction < val_cutoff:
         return "val"
     return "test"
+
+
+def assign_case_study_split(key: object) -> str:
+    active_weight = TRAIN_SPLIT_WEIGHTS[0] + TRAIN_SPLIT_WEIGHTS[1]
+    if active_weight <= 0 or TRAIN_SPLIT_WEIGHTS[1] <= 0:
+        return "train"
+    train_cutoff = TRAIN_SPLIT_WEIGHTS[0] / active_weight
+    return "train" if _dataset_split_fraction(key) < train_cutoff else "val"
+
+
+def annotate_split_geography(
+    cells: gpd.GeoDataFrame,
+    *,
+    seed_neighborhoods: gpd.GeoDataFrame,
+    case_study_municipalities: tuple[str, ...] = CASE_STUDY_MUNICIPALITIES,
+) -> gpd.GeoDataFrame:
+    if cells.empty:
+        annotated = cells.copy()
+        annotated["seed_name"] = pd.Series(dtype="object")
+        annotated["is_seed_neighborhood"] = pd.Series(dtype="bool")
+        annotated["is_case_study_municipality"] = pd.Series(dtype="bool")
+        annotated["split_key"] = pd.Series(dtype="object")
+        annotated["dataset_split"] = pd.Series(dtype="object")
+        annotated["split_bucket"] = pd.Series(dtype="object")
+        return annotated
+
+    annotated = cells.copy()
+    annotated["seed_name"] = pd.Series([None] * len(annotated), dtype="object")
+    if not seed_neighborhoods.empty:
+        cells_3857 = annotated.to_crs(MODEL_CRS)
+        chip_span_m = infer_chip_span_m(cells_3857)
+        chip_footprints = gpd.GeoDataFrame(
+            annotated[["tile_id"]].copy(),
+            geometry=[box(*chip_bounds_from_geometry(geometry, chip_span_m)) for geometry in cells_3857.geometry],
+            crs=MODEL_CRS,
+        ).to_crs(OUTPUT_CRS)
+        seed_join = gpd.sjoin(
+            chip_footprints,
+            seed_neighborhoods[["seed_name", "geometry"]],
+            predicate="intersects",
+            how="left",
+        )
+        if not seed_join.empty:
+            seed_lookup = (
+                seed_join.dropna(subset=["seed_name"])
+                .sort_values(["tile_id", "seed_name"], kind="stable")
+                .drop_duplicates(subset=["tile_id"], keep="first")
+                [["tile_id", "seed_name"]]
+            )
+            annotated = annotated.merge(seed_lookup, on="tile_id", how="left", suffixes=("", "_matched"))
+            if "seed_name_matched" in annotated.columns:
+                annotated["seed_name"] = annotated["seed_name_matched"].combine_first(annotated["seed_name"])
+                annotated = annotated.drop(columns=["seed_name_matched"])
+
+    annotated["is_case_study_municipality"] = annotated["municipio"].fillna("").isin(case_study_municipalities)
+    annotated["is_seed_neighborhood"] = annotated["seed_name"].notna() & annotated["is_case_study_municipality"]
+    annotated["split_key"] = annotated["h3_cell_id"].where(annotated["h3_cell_id"].notna(), annotated["tile_id"]).astype(str)
+    annotated["dataset_split"] = "train"
+    case_study_mask = (~annotated["is_seed_neighborhood"]) & annotated["is_case_study_municipality"]
+    if case_study_mask.any():
+        annotated.loc[case_study_mask, "dataset_split"] = annotated.loc[case_study_mask, "split_key"].map(assign_case_study_split)
+    annotated.loc[annotated["is_seed_neighborhood"], "dataset_split"] = "test"
+    annotated["split_bucket"] = np.select(
+        [
+            annotated["is_seed_neighborhood"],
+            case_study_mask & (annotated["dataset_split"] == "val"),
+            case_study_mask & (annotated["dataset_split"] == "train"),
+        ],
+        [
+            "seed_neighborhood_test",
+            "case_study_val",
+            "case_study_train",
+        ],
+        default="island_train",
+    )
+    return annotated
+
+
+def select_cells_for_dataset_cohort(cells: gpd.GeoDataFrame, *, dataset_cohort: str) -> gpd.GeoDataFrame:
+    dataset_cohort = _normalize_choice(
+        dataset_cohort,
+        name="dataset_cohort",
+        valid_values=VALID_DATASET_COHORTS,
+    )
+    if dataset_cohort == "holdout_priority3":
+        return cells[cells["dataset_split"] == "test"].copy()
+    return cells.copy()
+
+
+def rebalance_validation_split(
+    cells: gpd.GeoDataFrame,
+    *,
+    min_validation_share: float = MIN_VALIDATION_SHARE,
+) -> gpd.GeoDataFrame:
+    if cells.empty or min_validation_share <= 0:
+        return cells
+
+    adjusted = cells.copy()
+    test_count = int((adjusted["dataset_split"] == "test").sum())
+    if test_count <= 0:
+        return adjusted
+
+    total_count = int(len(adjusted))
+    target_share = min(float(min_validation_share), float(test_count) / float(max(total_count, 1)))
+    target_val_count = int(math.ceil(total_count * target_share))
+    current_val_count = int((adjusted["dataset_split"] == "val").sum())
+    promote_count = max(target_val_count - current_val_count, 0)
+    if promote_count <= 0:
+        return adjusted
+
+    promotion_pool = adjusted[adjusted["split_bucket"] == "case_study_train"].copy()
+    if promotion_pool.empty:
+        return adjusted
+
+    promotion_pool["split_fraction"] = promotion_pool["split_key"].map(_dataset_split_fraction)
+    promotions = promotion_pool.sort_values(
+        ["split_fraction", "osm_pv_count", "building_count", "tile_id"],
+        ascending=[False, False, False, True],
+        kind="stable",
+    ).head(promote_count)
+    if promotions.empty:
+        return adjusted
+
+    promotion_ids = set(promotions["tile_id"].astype(str))
+    adjusted.loc[adjusted["tile_id"].astype(str).isin(promotion_ids), "dataset_split"] = "val"
+    adjusted.loc[adjusted["tile_id"].astype(str).isin(promotion_ids), "split_bucket"] = "case_study_val"
+    return adjusted
+
+
+def repair_existing_manifest_splits(
+    records: pd.DataFrame,
+    *,
+    cells: gpd.GeoDataFrame,
+    dataset_cohort: str,
+) -> pd.DataFrame:
+    if records.empty:
+        return records.copy()
+
+    join_key = "tile_id" if "tile_id" in records.columns and "tile_id" in cells.columns else "h3_cell_id"
+    lookup_columns = [
+        join_key,
+        "dataset_split",
+        "split_key",
+        "split_bucket",
+        "seed_name",
+        "is_seed_neighborhood",
+        "is_case_study_municipality",
+    ]
+    split_lookup = cells[[column_name for column_name in lookup_columns if column_name in cells.columns]].drop_duplicates(
+        subset=[join_key],
+        keep="first",
+    )
+    repaired = records.drop(
+        columns=[
+            column_name
+            for column_name in (
+                "dataset_split",
+                "split_key",
+                "split_bucket",
+                "seed_name",
+                "is_seed_neighborhood",
+                "is_case_study_municipality",
+                "holdout_group",
+                "split_policy",
+                "split_seed",
+            )
+            if column_name in records.columns
+        ]
+    ).copy()
+    repaired = repaired.merge(split_lookup, on=join_key, how="left")
+    missing_lookup = repaired["dataset_split"].isna()
+    missing_count = int(missing_lookup.sum())
+    if missing_count:
+        print(
+            f"warning: {missing_count:,} existing manifest rows were missing from the current split lookup; "
+            "falling back to split_key hashing for those rows."
+        )
+    key_series = repaired.get("h3_cell_id", repaired.get("tile_id", pd.Series(index=repaired.index, dtype="object")))
+    repaired["split_key"] = repaired["split_key"].fillna(key_series.astype(str))
+    repaired["dataset_split"] = repaired["dataset_split"].fillna(repaired["split_key"].map(assign_dataset_split))
+    if "split_bucket" in repaired.columns:
+        inferred_split_bucket = pd.Series(
+            np.select(
+                [
+                    repaired["dataset_split"] == "test",
+                    repaired["dataset_split"] == "val",
+                    repaired.get("is_case_study_municipality", False).fillna(False),
+                ],
+                [
+                    "seed_neighborhood_test",
+                    "case_study_val",
+                    "case_study_train",
+                ],
+                default="island_train",
+            ),
+            index=repaired.index,
+            dtype="object",
+        )
+        repaired["split_bucket"] = repaired["split_bucket"].fillna(
+            inferred_split_bucket
+        )
+    repaired["holdout_group"] = np.where(repaired["dataset_split"] == "test", HOLDOUT_GROUP_LABEL, None)
+    repaired["split_policy"] = SPLIT_POLICY
+    repaired["split_seed"] = "sha1(split_key)"
+    if "dataset_cohort" in repaired.columns:
+        repaired["dataset_cohort"] = dataset_cohort
+    if dataset_cohort == "holdout_priority3":
+        repaired = repaired[repaired["dataset_split"] == "test"].copy()
+    return repaired.reset_index(drop=True)
+
+
+def run_training_export_workflow() -> tuple[pd.DataFrame | None, gpd.GeoDataFrame | None]:
+    con = connect(resolve_db_path())
+    cells = load_training_cells(
+        con,
+        dataset_cohort=DATASET_COHORT,
+        target_municipalities=TARGET_MUNICIPALITIES,
+        min_priority_score=MIN_PRIORITY_SCORE,
+        max_priority_score=MAX_PRIORITY_SCORE,
+        max_tiles_per_municipality=MAX_TILES_PER_MUNICIPALITY,
+        max_tiles=MAX_TILES,
+    )
+    osm_pv = load_osm_pv_polygons(con)
+    municipality_boundaries = load_municipality_boundaries(con)
+    cell_h3_ids = tuple(sorted({str(value) for value in cells["h3_cell_id"].dropna().astype(str).tolist()})) if not cells.empty else ()
+    overture_buildings = load_overture_buildings(con, h3_cell_ids=cell_h3_ids)
+    con.close()
+
+    seed_neighborhoods = load_seed_neighborhoods()
+    cells = annotate_split_geography(cells, seed_neighborhoods=seed_neighborhoods)
+    cells = rebalance_validation_split(cells)
+    export_cells = select_cells_for_dataset_cohort(cells, dataset_cohort=DATASET_COHORT)
+    train_layout = resolve_training_layout(TRAIN_ROOT)
+    highlighted_boundaries = municipality_boundaries[
+        municipality_boundaries["name"].fillna("").isin(CASE_STUDY_MUNICIPALITIES)
+    ].copy() if not municipality_boundaries.empty else municipality_boundaries
+
+    if TARGET_MUNICIPALITIES:
+        print(f"target municipalities: {', '.join(TARGET_MUNICIPALITIES)}")
+        if len(TARGET_MUNICIPALITIES) <= 2:
+            print(
+                "note: municipality scope is constrained; for island-wide export set "
+                "GEOAI_TARGET_MUNICIPALITIES=all (or unset it)."
+            )
+    else:
+        print("target municipalities: ALL (island-wide)")
+    print(f"minimum priority score: {MIN_PRIORITY_SCORE}")
+    if MAX_PRIORITY_SCORE is not None:
+        print(f"maximum priority score: {MAX_PRIORITY_SCORE}")
+    if MAX_TILES_PER_MUNICIPALITY > 0:
+        print(f"per-municipality tile cap: {MAX_TILES_PER_MUNICIPALITY}")
+    if MAX_TILES > 0:
+        print(f"global tile cap: {MAX_TILES}")
+    if CASE_STUDY_MUNICIPALITIES:
+        print(f"case-study municipalities: {', '.join(CASE_STUDY_MUNICIPALITIES)}")
+    print(f"selected H3 tiles with OSM PV labels: {len(cells):,}")
+    print(f"planned geographic split counts: {cells['dataset_split'].value_counts().to_dict() if not cells.empty else {}}")
+    print(f"OSM rooftop PV polygons: {len(osm_pv):,}")
+    if cells.empty:
+        print("no manifest tiles with OSM PV labels were found; run the manifest builder first.")
+        return None, osm_pv
+    if osm_pv.empty:
+        print("no OSM rooftop PV polygons were found; run the OSM ingestion notebook first.")
+        return None, osm_pv
+    if overture_buildings.empty:
+        print("no Overture buildings were found for the selected training cells; run the Overture ingestion notebook first.")
+        return None, osm_pv
+
+    split_map_path = write_split_spatial_overview(
+        cells,
+        layout=train_layout,
+        title="Candidate training tiles by split (pre-fetch preview)",
+        file_name="dataset_split_plan_overview.png",
+        boundaries=municipality_boundaries,
+        highlight_boundaries=highlighted_boundaries,
+    )
+    if split_map_path is not None:
+        print(f"pre-fetch split overview: {split_map_path}")
+
+    if REFETCH_PRIORITY_SEED_MISMATCHES_ONLY:
+        mismatch_cells = identify_priority_seed_mismatch_cells(cells)
+        if mismatch_cells.empty:
+            print("priority/seed mismatch refetch skipped: no mismatch cells found.")
+            return None, osm_pv
+        if not train_layout.manifest_path.exists():
+            print("priority/seed mismatch refetch skipped: no existing training manifest was found.")
+            return None, osm_pv
+
+        mismatch_tile_ids = set(mismatch_cells["tile_id"].dropna().astype(str))
+        print(f"priority/seed mismatch cells selected for refetch: {len(mismatch_tile_ids):,}")
+        remove_manifest_rows_and_artifacts(
+            train_layout,
+            tile_ids=mismatch_tile_ids,
+            imagery_source=IMAGERY_SOURCE,
+            dataset_cohort=DATASET_COHORT,
+        )
+        refreshed_records = export_training_dataset(
+            mismatch_cells,
+            osm_pv,
+            overture_buildings,
+            layout=train_layout,
+            overwrite_existing=True,
+            imagery_source=IMAGERY_SOURCE,
+            dataset_cohort=DATASET_COHORT,
+        )
+        if refreshed_records.empty:
+            print("priority/seed mismatch refetch wrote no replacement chips; inspect imagery and label coverage.")
+            return refreshed_records, osm_pv
+        refreshed_manifest = write_training_summary(
+            refreshed_records,
+            layout=train_layout,
+            min_priority_score=MIN_PRIORITY_SCORE,
+            max_priority_score=MAX_PRIORITY_SCORE,
+            imagery_source=IMAGERY_SOURCE,
+            dataset_cohort=DATASET_COHORT,
+        )
+        summarize_dataset_split_diagnostics(cells, refreshed_manifest)
+        refreshed_map_path = write_split_spatial_overview(
+            refreshed_manifest,
+            layout=train_layout,
+            title="Training manifest by split after priority/seed mismatch refetch",
+            boundaries=municipality_boundaries,
+            highlight_boundaries=highlighted_boundaries,
+        )
+        if refreshed_map_path is not None:
+            print(f"refreshed split spatial overview: {refreshed_map_path}")
+        print(f"refetched {len(refreshed_records):,} priority/seed mismatch chips into {train_layout.train_root}")
+        return refreshed_manifest, osm_pv
+
+    if REPAIR_EXISTING_SPLITS_ONLY:
+        if not train_layout.manifest_path.exists():
+            print("split repair skipped: no existing training manifest was found.")
+            return None, osm_pv
+        existing_manifest = pd.read_csv(train_layout.manifest_path)
+        repaired_manifest = repair_existing_manifest_splits(
+            existing_manifest,
+            cells=cells,
+            dataset_cohort=DATASET_COHORT,
+        )
+        repaired_manifest = write_training_summary(
+            repaired_manifest,
+            layout=train_layout,
+            min_priority_score=MIN_PRIORITY_SCORE,
+            max_priority_score=MAX_PRIORITY_SCORE,
+            imagery_source=IMAGERY_SOURCE,
+            dataset_cohort=DATASET_COHORT,
+        )
+        summarize_dataset_split_diagnostics(cells, repaired_manifest)
+        repaired_map_path = write_split_spatial_overview(
+            repaired_manifest,
+            layout=train_layout,
+            title="Existing training manifest by split (repaired metadata)",
+            boundaries=municipality_boundaries,
+            highlight_boundaries=highlighted_boundaries,
+        )
+        if repaired_map_path is not None:
+            print(f"repaired split spatial overview: {repaired_map_path}")
+        print(f"repaired split metadata for {len(repaired_manifest):,} existing chips in {train_layout.manifest_path}")
+        return repaired_manifest, osm_pv
+
+    _prepare_training_root(TRAIN_ROOT, reset_root=RESET_TRAIN_ROOT)
+    manifest = export_training_dataset(
+        export_cells,
+        osm_pv,
+        overture_buildings,
+        layout=train_layout,
+        imagery_source=IMAGERY_SOURCE,
+        dataset_cohort=DATASET_COHORT,
+    )
+    if manifest.empty:
+        print("no training chips were written; inspect imagery availability, NAIP coverage, and manifest filtering.")
+        return manifest, osm_pv
+
+    manifest = write_training_summary(
+        manifest,
+        layout=train_layout,
+        min_priority_score=MIN_PRIORITY_SCORE,
+        max_priority_score=MAX_PRIORITY_SCORE,
+        imagery_source=IMAGERY_SOURCE,
+        dataset_cohort=DATASET_COHORT,
+    )
+    summarize_dataset_split_diagnostics(export_cells, manifest)
+    split_map_path = write_split_spatial_overview(
+        manifest,
+        layout=train_layout,
+        boundaries=municipality_boundaries,
+        highlight_boundaries=highlighted_boundaries,
+    )
+    if split_map_path is not None:
+        print(f"split spatial overview: {split_map_path}")
+    print(f"wrote {len(manifest):,} {IMAGERY_SOURCE_LABELS[IMAGERY_SOURCE]} image chips to {train_layout.image_dir}")
+    print(f"wrote {len(manifest):,} raw binary mask chips to {train_layout.mask_dir}")
+    print(f"wrote {len(manifest):,} grounded mask chips to {train_layout.grounded_mask_dir}")
+    return manifest, osm_pv
 
 
 def infer_chip_span_m(cells_3857: gpd.GeoDataFrame) -> int:
@@ -469,7 +1102,7 @@ def fetch_contextily_chip(bounds: tuple[float, float, float, float], target_tran
             north,
             str(raster_path),
             zoom=_resolve_zoom(CONTEXTILY_ZOOM_RAW),
-            source=TRAIN_SOURCE,
+            source=ESRI_CONTEXTILY_SOURCE,
             ll=False,
             use_cache=CONTEXTILY_USE_CACHE,
         )
@@ -500,59 +1133,277 @@ def fetch_contextily_chip(bounds: tuple[float, float, float, float], target_tran
     return out
 
 
-def preview_training_samples(
-    records: pd.DataFrame,
-    osm_pv: gpd.GeoDataFrame,
+def load_naip_tile_index(
     *,
-    sample_count: int = PREVIEW_SAMPLE_COUNT,
-    overlay_alpha: float = PREVIEW_OVERLAY_ALPHA,
-) -> None:
-    if records.empty or sample_count <= 0:
+    target_municipalities: tuple[str, ...] = TARGET_MUNICIPALITIES,
+) -> dict[str, dict[str, object]]:
+    source_priority = {name: index for index, name in enumerate(NAIP_SOURCE_NAMES)}
+
+    if STAC_TILE_MANIFEST.exists():
+        frame = pd.read_parquet(STAC_TILE_MANIFEST)
+        if frame.empty:
+            return {}
+        if "source" in frame.columns:
+            frame = frame[frame["source"].isin(NAIP_SOURCE_NAMES)].copy()
+        if "asset_role" in frame.columns:
+            frame = frame[frame["asset_role"].fillna("").str.lower() == "visual"].copy()
+        if "status" in frame.columns:
+            frame = frame[frame["status"].fillna("").str.lower() == "fetched"].copy()
+        if target_municipalities and "municipio" in frame.columns:
+            frame = frame[frame["municipio"].isin(target_municipalities)].copy()
+        if frame.empty or "h3_cell_id" not in frame.columns:
+            return {}
+
+        frame["tile_abs_path"] = frame["tile_path"].map(lambda value: (PROJECT_ROOT / str(value)).resolve())
+        frame["local_asset_abs_path"] = frame["local_asset_path"].map(
+            lambda value: (PROJECT_ROOT / str(value)).resolve() if isinstance(value, str) and value else None
+        )
+        recency_candidates = (
+            "acquired",
+            "datetime",
+            "item_datetime",
+            "start_datetime",
+            "end_datetime",
+            "updated",
+            "fetched_at",
+            "ingested_at",
+            "created",
+        )
+        recency_series = pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns, UTC]")
+        for column_name in recency_candidates:
+            if column_name not in frame.columns:
+                continue
+            parsed = pd.to_datetime(frame[column_name], errors="coerce", utc=True)
+            recency_series = recency_series.where(parsed.isna(), parsed)
+        frame["item_recency"] = recency_series
+        frame["source_rank"] = frame["source"].map(lambda value: source_priority.get(str(value), len(source_priority)))
+        frame = frame.sort_values(
+            ["item_recency", "source_rank", "building_count", "h3_cell_id"],
+            ascending=[False, True, False, True],
+            kind="stable",
+        )
+
+        index: dict[str, dict[str, object]] = {}
+        for item in frame.itertuples(index=False):
+            h3_cell_id = str(getattr(item, "h3_cell_id", "") or "")
+            if not h3_cell_id or h3_cell_id in index:
+                continue
+
+            source_path = None
+            local_asset_path = getattr(item, "local_asset_abs_path", None)
+            tile_path = getattr(item, "tile_abs_path", None)
+            if isinstance(local_asset_path, Path) and local_asset_path.exists():
+                source_path = local_asset_path
+            elif isinstance(tile_path, Path) and tile_path.exists():
+                source_path = tile_path
+            if source_path is None:
+                continue
+
+            index[h3_cell_id] = {
+                "source": str(getattr(item, "source", "naip")),
+                "source_path": source_path,
+                "tile_path": tile_path if isinstance(tile_path, Path) else source_path,
+                # Bounds written by notebook 08 (EPSG:3857). Present when the
+                # tile was exported via export_square_tiles_for_asset; fall
+                # back to None so the caller can read them from the GeoTIFF.
+                "west_3857": getattr(item, "west_3857", None) or None,
+                "south_3857": getattr(item, "south_3857", None) or None,
+                "east_3857": getattr(item, "east_3857", None) or None,
+                "north_3857": getattr(item, "north_3857", None) or None,
+            }
+        return index
+
+    candidates = collect_naip_stac_preview_rasters(PROJECT_ROOT, exclude_stems=set())
+    index: dict[str, dict[str, object]] = {}
+    for path in candidates:
+        h3_cell_id = path.stem.split("_visual")[0]
+        if not h3_cell_id or h3_cell_id in index:
+            continue
+        index[h3_cell_id] = {
+            "source": infer_stac_source_name(path),
+            "source_path": path,
+            "tile_path": path,
+        }
+    return index
+
+
+def fetch_local_raster_chip(source_path: Path, target_transform) -> np.ndarray:
+    out = np.zeros((3, CHIP_PIXELS, CHIP_PIXELS), dtype=np.float32)
+    with rasterio.open(source_path) as src:
+        source_band_count = max(1, min(src.count, 3))
+        if source_band_count == 1:
+            band_indices = (1, 1, 1)
+        elif source_band_count == 2:
+            band_indices = (1, 2, 2)
+        else:
+            band_indices = (1, 2, 3)
+
+        for destination_index, source_band_index in enumerate(band_indices):
+            reproject(
+                source=rasterio.band(src, source_band_index),
+                destination=out[destination_index],
+                src_transform=src.transform,
+                src_crs=src.crs or MODEL_CRS,
+                dst_transform=target_transform,
+                dst_crs=MODEL_CRS,
+                resampling=Resampling.bilinear,
+            )
+
+    if out.max() <= 1.0:
+        out *= 255.0
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def fetch_naip_chip(row, target_transform, naip_tile_index: dict[str, dict[str, object]]) -> tuple[np.ndarray, str]:
+    if pd.isna(row.h3_cell_id):
+        raise RuntimeError(f"{row.tile_id} is missing h3_cell_id; cannot resolve NAIP tile")
+
+    h3_cell_id = str(row.h3_cell_id)
+    tile_record = naip_tile_index.get(h3_cell_id)
+    if tile_record is None:
+        raise RuntimeError(f"no local NAIP tile found for h3_cell_id={h3_cell_id}")
+
+    source_path = Path(tile_record["source_path"])
+    return fetch_local_raster_chip(source_path, target_transform), str(tile_record["source"])
+
+
+def fetch_imagery_chip(
+    row,
+    bounds: tuple[float, float, float, float],
+    target_transform,
+    *,
+    imagery_source: str,
+    naip_tile_index: dict[str, dict[str, object]] | None,
+) -> tuple[np.ndarray, str]:
+    imagery_source = _normalize_choice(
+        imagery_source,
+        name="imagery_source",
+        valid_values=VALID_IMAGERY_SOURCES,
+    )
+    if imagery_source == "esri":
+        return fetch_contextily_chip(bounds, target_transform), "Esri.WorldImagery"
+    if not naip_tile_index:
+        raise RuntimeError("NAIP imagery requested, but no local NAIP STAC tiles were found.")
+    return fetch_naip_chip(row, target_transform, naip_tile_index)
+
+
+def summarize_dataset_split_diagnostics(cells: gpd.GeoDataFrame, records: pd.DataFrame) -> None:
+    if cells.empty:
+        print("split diagnostics skipped: no candidate cells available.")
         return
+
+    eligible = cells.copy()
+    total_eligible = int(len(eligible))
+    holdout_eligible = int((eligible["priority_score"].fillna(0).astype(int) == HOLDOUT_PRIORITY_SCORE).sum())
+    print(
+        "eligible manifest cells: "
+        f"{total_eligible:,} total | priority-{HOLDOUT_PRIORITY_SCORE} holdout candidates={holdout_eligible:,} "
+        f"({(100.0 * holdout_eligible / max(total_eligible, 1)):.1f}%)"
+    )
+
+    if records.empty:
+        print("split diagnostics skipped: no exported records.")
+        return
+
+    split_counts = records["dataset_split"].value_counts().to_dict()
+    print(f"exported split counts: {split_counts}")
+
+    if "split_bucket" in records.columns:
+        print(f"split bucket counts: {records['split_bucket'].value_counts().to_dict()}")
+
+    if "priority_score" in records.columns:
+        priority_summary = (
+            records.groupby(["dataset_split", "priority_score"]).size().rename("tiles").reset_index()
+            .sort_values(["priority_score", "dataset_split"], ascending=[False, True])
+        )
+        print("split x priority summary:")
+        print(priority_summary.to_string(index=False))
+
+        if "split_bucket" in records.columns:
+            mismatch_mask = (
+                ((records["priority_score"].fillna(0).astype(int) == HOLDOUT_PRIORITY_SCORE) & (records["split_bucket"] != "seed_neighborhood_test"))
+                | ((records["priority_score"].fillna(0).astype(int) != HOLDOUT_PRIORITY_SCORE) & (records["split_bucket"] == "seed_neighborhood_test"))
+            )
+            mismatch_count = int(mismatch_mask.sum())
+            if mismatch_count > 0:
+                print(
+                    "priority/seed mismatch count: "
+                    f"{mismatch_count:,} rows differ because manifest priority uses broader H3 overlap, "
+                    "while the dataset split uses the square training chip footprint."
+                )
+
+
+def write_split_spatial_overview(
+    records: pd.DataFrame | gpd.GeoDataFrame,
+    *,
+    layout: TrainingLayout,
+    title: str = "Exported training tiles by split (centroid overlay)",
+    file_name: str = "dataset_split_spatial_overview.png",
+    boundaries: gpd.GeoDataFrame | None = None,
+    highlight_boundaries: gpd.GeoDataFrame | None = None,
+) -> Path | None:
+    if records.empty:
+        return None
 
     import matplotlib.pyplot as plt
 
-    sample = records.sample(n=min(sample_count, len(records)), random_state=0).reset_index(drop=True)
-    polygons_3857 = osm_pv.to_crs(MODEL_CRS)
-    ncols = min(3, len(sample))
-    nrows = int(math.ceil(len(sample) / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 6 * nrows), squeeze=False)
+    split_palette = {
+        "train": "#2ca02c",
+        "val": "#1f77b4",
+        "test": "#d62728",
+    }
+    if isinstance(records, gpd.GeoDataFrame) and "geometry" in records.columns:
+        points_gdf = records.to_crs(OUTPUT_CRS).copy()
+        points_gdf = gpd.GeoDataFrame(
+            points_gdf.drop(columns=["geometry"]),
+            geometry=points_gdf.geometry.representative_point(),
+            crs=OUTPUT_CRS,
+        )
+    else:
+        points = records.copy()
+        required_cols = {"west", "south", "east", "north", "dataset_split"}
+        if not required_cols.issubset(points.columns):
+            return None
+        points["x"] = (points["west"].astype(float) + points["east"].astype(float)) / 2.0
+        points["y"] = (points["south"].astype(float) + points["north"].astype(float)) / 2.0
+        points_gdf = gpd.GeoDataFrame(
+            points,
+            geometry=gpd.points_from_xy(points["x"], points["y"], crs=MODEL_CRS),
+            crs=MODEL_CRS,
+        ).to_crs(OUTPUT_CRS)
 
-    for ax, row in zip(axes.flat, sample.itertuples(index=False)):
-        image_path = PROJECT_ROOT / str(row.image_path)
-        with rasterio.open(image_path) as src:
-            image = src.read()
-            bounds = src.bounds
-            chip_crs = str(src.crs or MODEL_CRS)
+    extent_geom = points_gdf.geometry.union_all().convex_hull
+    fig, ax = plt.subplots(figsize=(12, 6))
+    if boundaries is not None and not boundaries.empty:
+        boundaries.to_crs(OUTPUT_CRS).boundary.plot(ax=ax, color="#9ca3af", linewidth=0.4, alpha=0.55)
+    if highlight_boundaries is not None and not highlight_boundaries.empty:
+        highlight_boundaries.to_crs(OUTPUT_CRS).boundary.plot(ax=ax, color="#111827", linewidth=1.0, alpha=0.85)
+    gpd.GeoSeries([extent_geom], crs=OUTPUT_CRS).boundary.plot(ax=ax, color="#1f2937", linewidth=1.0)
 
-        if image.shape[0] == 1:
-            image = np.repeat(image, 3, axis=0)
-        if image.shape[0] > 3:
-            image = image[:3]
-        image = np.moveaxis(image, 0, -1).astype(np.float32)
-        if image.max() > 1.0:
-            image /= 255.0
+    for split_name in ("train", "val", "test"):
+        subset = points_gdf[points_gdf["dataset_split"] == split_name]
+        if subset.empty:
+            continue
+        subset.plot(
+            ax=ax,
+            markersize=8,
+            color=split_palette[split_name],
+            alpha=0.5,
+            label=f"{split_name} ({len(subset):,})",
+        )
 
-        extent = (bounds.left, bounds.right, bounds.bottom, bounds.top)
-        label_bounds = (bounds.left, bounds.bottom, bounds.right, bounds.top)
-        ax.imshow(image, extent=extent)
-
-        label_subset = select_polygons_for_bounds(polygons_3857, label_bounds)
-        if not label_subset.empty:
-            label_subset.to_crs(chip_crs).plot(
-                ax=ax,
-                facecolor=(1.0, 0.3, 0.2, overlay_alpha),
-                edgecolor=(1.0, 1.0, 1.0, 0.9),
-                linewidth=0.8,
-            )
-
-        ax.set_title(f"{row.tile_id} | {row.municipio} | priority {row.priority_score}")
-        ax.set_axis_off()
-
-    for ax in axes.flat[len(sample):]:
-        ax.set_axis_off()
-    fig.suptitle("Training chip preview with OSM PV overlays", fontsize=14)
+    ax.set_title(title)
+    ax.set_axis_off()
+    ax.legend(loc="best")
+    figure_path = MAP_OUTPUT_DIR / file_name
+    figure_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path = layout.review_dir / file_name
+    if legacy_path.exists():
+        legacy_path.unlink()
     fig.tight_layout()
+    fig.savefig(figure_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return figure_path
 
 
 def rasterize_labels(polygons_3857: gpd.GeoDataFrame, target_transform) -> np.ndarray:
@@ -645,7 +1496,7 @@ def ground_labels_to_overture_buildings(
         lambda values: [int(value) for value in sorted(values.tolist())]
     )
     prompt_geometry_by_building = grounded.groupby("building_id")["geometry"].apply(
-        lambda values: unary_union(
+        lambda values: union_all(
             [geometry for geometry in values.tolist() if geometry is not None and not geometry.is_empty]
         )
     )
@@ -858,6 +1709,74 @@ def write_chip(path: Path, data: np.ndarray, *, transform, crs: str) -> None:
         dst.write(write_data)
 
 
+def link_stac_tile_to_layout(stac_tile_path: Path, layout_path: Path) -> bool:
+    """Point layout_path at the existing STAC tile using the cheapest mechanism.
+
+    Preference order:
+    1. Hard link (os.link) – same inode, zero storage cost, completely
+       transparent to rasterio / PyTorch DataLoader.  Fails across devices.
+    2. Absolute symlink – works across devices; follows correctly as long as
+       the stac_tiles directory is not moved.
+    Returns True if a link was created, False if the caller should fall back
+    to a full write (e.g. both strategies failed).
+    """
+    layout_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if layout_path.exists() or layout_path.is_symlink():
+        return True  # already present from a prior run
+
+    try:
+        os.link(stac_tile_path, layout_path)
+        return True
+    except OSError:
+        pass  # cross-device or unsupported filesystem
+
+    try:
+        os.symlink(stac_tile_path.resolve(), layout_path)
+        return True
+    except OSError:
+        return False
+
+
+def resolve_dataset_split(
+    key: object,
+    *,
+    priority_score: object,
+    dataset_cohort: str,
+    is_seed_neighborhood: object = False,
+    is_case_study_municipality: object = False,
+) -> str:
+    if bool(is_seed_neighborhood):
+        return "test"
+    if bool(is_case_study_municipality):
+        return assign_case_study_split(key)
+    if dataset_cohort == "holdout_priority3":
+        return "test"
+    if SPLIT_POLICY == "priority3_holdout" and pd.notna(priority_score) and int(priority_score) == HOLDOUT_PRIORITY_SCORE:
+        return "test"
+    return assign_dataset_split(key)
+
+
+def _manifest_file_list_hash(records: pd.DataFrame) -> str | None:
+    if records.empty:
+        return None
+    columns = [
+        column_name
+        for column_name in ("tile_id", "h3_cell_id", "imagery_source", "dataset_cohort", "dataset_split", "split_key")
+        if column_name in records.columns
+    ]
+    if not columns:
+        return None
+    ordered = (
+        records[columns]
+        .fillna("")
+        .astype(str)
+        .sort_values(columns, kind="stable")
+        .to_dict(orient="records")
+    )
+    return hashlib.sha1(json.dumps(ordered, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def _build_manifest_row(
     row,
     *,
@@ -879,6 +1798,9 @@ def _build_manifest_row(
     split_name: str,
     split_key: str,
     status: str,
+    imagery_source: str,
+    provider_name: str,
+    dataset_cohort: str,
 ) -> dict[str, object]:
     return {
         "tile_id": row.tile_id,
@@ -892,11 +1814,21 @@ def _build_manifest_row(
         "osm_pv_count": row.osm_pv_count,
         "chip_pixels": CHIP_PIXELS,
         "chip_span_m": chip_span_m,
+        "meters_per_pixel": float(chip_span_m / CHIP_PIXELS),
+        "imagery_source": imagery_source,
         "contextily_zoom": CONTEXTILY_ZOOM_RAW,
-        "provider": "Esri.WorldImagery",
+        "provider": provider_name,
         "crs": MODEL_CRS,
+        "dataset_cohort": dataset_cohort,
+        "holdout_group": HOLDOUT_GROUP_LABEL if split_name == "test" else None,
         "dataset_split": split_name,
+        "split_policy": SPLIT_POLICY,
+        "split_seed": "sha1(split_key)",
         "split_key": split_key,
+        "split_bucket": getattr(row, "split_bucket", None),
+        "seed_name": getattr(row, "seed_name", None),
+        "is_seed_neighborhood": bool(getattr(row, "is_seed_neighborhood", False)),
+        "is_case_study_municipality": bool(getattr(row, "is_case_study_municipality", False)),
         "west": bounds[0],
         "south": bounds[1],
         "east": bounds[2],
@@ -937,8 +1869,76 @@ def merge_training_manifest(manifest_path: Path, records: pd.DataFrame) -> pd.Da
             existing = pd.DataFrame()
         if not existing.empty and "tile_id" in existing.columns:
             merged = pd.concat([existing, merged], ignore_index=True)
-            merged = merged.drop_duplicates(subset=["tile_id"], keep="last").reset_index(drop=True)
+            dedupe_columns = [
+                column_name
+                for column_name in ("tile_id", "imagery_source", "dataset_cohort")
+                if column_name in merged.columns
+            ]
+            merged = merged.drop_duplicates(subset=dedupe_columns or ["tile_id"], keep="last").reset_index(drop=True)
     return merged
+
+
+def identify_priority_seed_mismatch_cells(cells: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    if cells.empty or "priority_score" not in cells.columns or "split_bucket" not in cells.columns:
+        return cells.iloc[0:0].copy()
+
+    priority_holdout = cells["priority_score"].fillna(0).astype(int) == HOLDOUT_PRIORITY_SCORE
+    seed_test = cells["split_bucket"] == "seed_neighborhood_test"
+    return cells[priority_holdout.ne(seed_test)].copy()
+
+
+def remove_manifest_rows_and_artifacts(
+    layout: TrainingLayout,
+    *,
+    tile_ids: set[str],
+    imagery_source: str,
+    dataset_cohort: str,
+) -> pd.DataFrame:
+    if not layout.manifest_path.exists() or not tile_ids:
+        return pd.DataFrame()
+
+    manifest = pd.read_csv(layout.manifest_path)
+    if manifest.empty or "tile_id" not in manifest.columns:
+        return manifest
+
+    row_mask = manifest["tile_id"].astype(str).isin(tile_ids)
+    if "imagery_source" in manifest.columns:
+        row_mask &= manifest["imagery_source"].fillna(imagery_source).astype(str).eq(imagery_source)
+    if "dataset_cohort" in manifest.columns:
+        row_mask &= manifest["dataset_cohort"].fillna(dataset_cohort).astype(str).eq(dataset_cohort)
+
+    rows_to_remove = manifest[row_mask].copy()
+    artifact_columns = [
+        "image_path",
+        "mask_path",
+        "raw_mask_path",
+        "grounded_mask_path",
+        "prompt_artifact_path",
+        "review_artifact_path",
+    ]
+    protected_root = layout.train_root.resolve()
+    removed_paths: set[Path] = set()
+    for column_name in artifact_columns:
+        if column_name not in rows_to_remove.columns:
+            continue
+        for raw_path in rows_to_remove[column_name].dropna().astype(str):
+            artifact_path = (PROJECT_ROOT / raw_path).resolve()
+            try:
+                artifact_path.relative_to(protected_root)
+            except ValueError:
+                continue
+            if artifact_path in removed_paths or not artifact_path.exists():
+                continue
+            artifact_path.unlink()
+            removed_paths.add(artifact_path)
+
+    remaining = manifest[~row_mask].reset_index(drop=True)
+    remaining.to_csv(layout.manifest_path, index=False)
+    print(
+        f"removed {len(rows_to_remove):,} priority/seed mismatch rows and {len(removed_paths):,} local artifacts "
+        f"from {layout.manifest_path}"
+    )
+    return rows_to_remove.reset_index(drop=True)
 
 
 def export_training_dataset(
@@ -948,6 +1948,8 @@ def export_training_dataset(
     *,
     layout: TrainingLayout,
     overwrite_existing: bool = OVERWRITE_EXISTING_CHIPS,
+    imagery_source: str = IMAGERY_SOURCE,
+    dataset_cohort: str = DATASET_COHORT,
 ) -> pd.DataFrame:
     if cells.empty:
         return pd.DataFrame()
@@ -956,10 +1958,36 @@ def export_training_dataset(
     osm_pv_3857 = osm_pv.to_crs(MODEL_CRS)
     overture_buildings_3857 = overture_buildings.to_crs(MODEL_CRS)
     chip_span_m = infer_chip_span_m(cells_3857)
+    naip_tile_index = load_naip_tile_index(target_municipalities=TARGET_MUNICIPALITIES) if imagery_source == "naip" else None
     records: list[dict[str, object]] = []
 
     for row in cells_3857.itertuples(index=False):
-        bounds = chip_bounds_from_geometry(row.geometry, chip_span_m)
+        # ── Resolve chip bounds ───────────────────────────────────────────────
+        # For NAIP: use the per-cell bounds already written by notebook 08 into
+        # the STAC tile manifest (west_3857 … north_3857).  This lets the image
+        # chip be a direct hard link / symlink to the existing stac_tiles
+        # GeoTIFF — no re-projection needed, no new derived copy on disk.
+        # For ESRI: keep the batch-uniform span so all contextily chips are
+        # square and identically sized.
+        h3_key = str(row.h3_cell_id) if pd.notna(row.h3_cell_id) else str(row.tile_id)
+        naip_tile_record: dict[str, object] | None = (
+            naip_tile_index.get(h3_key) if naip_tile_index is not None else None
+        )
+
+        if naip_tile_record is not None:
+            w = naip_tile_record.get("west_3857")
+            s = naip_tile_record.get("south_3857")
+            e = naip_tile_record.get("east_3857")
+            n = naip_tile_record.get("north_3857")
+            if None in (w, s, e, n):
+                # Bounds not in manifest – read from the GeoTIFF header.
+                with rasterio.open(naip_tile_record["tile_path"]) as _src:
+                    _b = _src.bounds
+                    w, s, e, n = _b.left, _b.bottom, _b.right, _b.top
+            bounds = (float(w), float(s), float(e), float(n))
+        else:
+            bounds = chip_bounds_from_geometry(row.geometry, chip_span_m)
+
         label_subset = select_polygons_for_bounds(osm_pv_3857, bounds)
         if label_subset.empty:
             continue
@@ -984,16 +2012,41 @@ def export_training_dataset(
         review_path = layout.review_dir / f"{stem}_review.png"
 
         image: np.ndarray | None = None
+        provider_name = "Esri.WorldImagery" if imagery_source == "esri" else "naip"
         fetched_image = False
         updated_assets = False
         if overwrite_existing or not image_path.exists():
-            try:
-                image = fetch_contextily_chip(bounds, transform)
-            except Exception as exc:
-                print(f"[warn] failed to fetch imagery for {row.tile_id}: {exc}")
-                continue
-            write_chip(image_path, image, transform=transform, crs=MODEL_CRS)
-            fetched_image = True
+            if naip_tile_record is not None:
+                # ── NAIP: link directly to the existing stac_tiles GeoTIFF ───
+                # outputs/stac_tiles is the canonical source; image_path in the
+                # training layout is a hard link (same inode, zero extra storage)
+                # or an absolute symlink if the layout is on a different device.
+                stac_tile_path = Path(naip_tile_record["tile_path"])
+                if not link_stac_tile_to_layout(stac_tile_path, image_path):
+                    # Both link strategies failed; fall back to a file copy.
+                    try:
+                        image_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(stac_tile_path, image_path)
+                    except Exception as exc:
+                        print(f"[warn] failed to link/copy stac tile for {row.tile_id}: {exc}")
+                        continue
+                provider_name = str(naip_tile_record.get("source", "naip"))
+                fetched_image = True
+            else:
+                # ── ESRI (or NAIP tile missing from index) ────────────────────
+                try:
+                    image, provider_name = fetch_imagery_chip(
+                        row,
+                        bounds,
+                        transform,
+                        imagery_source=imagery_source,
+                        naip_tile_index=naip_tile_index,
+                    )
+                except Exception as exc:
+                    print(f"[warn] failed to fetch {imagery_source} imagery for {row.tile_id}: {exc}")
+                    continue
+                write_chip(image_path, image, transform=transform, crs=MODEL_CRS)
+                fetched_image = True
 
         if overwrite_existing or not mask_path.exists():
             write_chip(mask_path, raw_mask, transform=transform, crs=MODEL_CRS)
@@ -1020,7 +2073,18 @@ def export_training_dataset(
             updated_assets = True
 
         split_key = str(row.h3_cell_id) if pd.notna(row.h3_cell_id) else str(row.tile_id)
-        split_name = assign_dataset_split(split_key)
+        if hasattr(row, "split_key") and pd.notna(row.split_key):
+            split_key = str(row.split_key)
+        if hasattr(row, "dataset_split") and pd.notna(row.dataset_split):
+            split_name = str(row.dataset_split)
+        else:
+            split_name = resolve_dataset_split(
+                split_key,
+                priority_score=row.priority_score,
+                dataset_cohort=dataset_cohort,
+                is_seed_neighborhood=getattr(row, "is_seed_neighborhood", False),
+                is_case_study_municipality=getattr(row, "is_case_study_municipality", False),
+            )
         if WRITE_REVIEW_ARTIFACTS and (overwrite_existing or not review_path.exists()):
             if image is None:
                 with rasterio.open(image_path) as src:
@@ -1038,6 +2102,8 @@ def export_training_dataset(
             updated_assets = True
 
         status = "fetched" if fetched_image else "updated" if updated_assets else "reused"
+        if not fetched_image and naip_tile_record is not None and (image_path.is_symlink() or (image_path.exists() and image_path.stat().st_nlink > 1)):
+            status = "linked"
 
         records.append(
             _build_manifest_row(
@@ -1060,6 +2126,9 @@ def export_training_dataset(
                 split_name=split_name,
                 split_key=split_key,
                 status=status,
+                imagery_source=imagery_source,
+                provider_name=provider_name,
+                dataset_cohort=dataset_cohort,
             )
         )
 
@@ -1072,11 +2141,14 @@ def write_training_summary(
     layout: TrainingLayout,
     min_priority_score: int,
     max_priority_score: int | None,
+    imagery_source: str = IMAGERY_SOURCE,
+    dataset_cohort: str = DATASET_COHORT,
 ) -> pd.DataFrame:
     layout.manifest_path.parent.mkdir(parents=True, exist_ok=True)
     merged_records = merge_training_manifest(layout.manifest_path, records)
     merged_records.to_csv(layout.manifest_path, index=False)
     status_counts = merged_records["status"].fillna("unknown").value_counts().to_dict() if not merged_records.empty else {}
+    providers = sorted(merged_records["provider"].dropna().astype(str).unique().tolist()) if not merged_records.empty else []
     summary = {
         "train_root": str(layout.train_root.relative_to(PROJECT_ROOT)),
         "image_count": int(len(merged_records)),
@@ -1086,9 +2158,21 @@ def write_training_summary(
         "review_artifact_count": int(merged_records["review_artifact_path"].notna().sum()) if not merged_records.empty and "review_artifact_path" in merged_records.columns else 0,
         "chip_pixels": CHIP_PIXELS,
         "chip_span_m": int(merged_records["chip_span_m"].iloc[0]) if not merged_records.empty else None,
+        "meters_per_pixel": float(merged_records["meters_per_pixel"].iloc[0]) if not merged_records.empty else None,
+        "imagery_source": imagery_source,
+        "dataset_cohort": dataset_cohort,
         "contextily_zoom": CONTEXTILY_ZOOM_RAW,
-        "provider": "Esri.WorldImagery",
+        "providers": providers,
         "dataset_splits": merged_records["dataset_split"].value_counts().to_dict() if not merged_records.empty else {},
+        "split_policy": SPLIT_POLICY,
+        "holdout_priority_score": HOLDOUT_PRIORITY_SCORE,
+        "holdout_group": HOLDOUT_GROUP_LABEL,
+        "split_weights": {
+            "train": TRAIN_SPLIT_WEIGHTS[0],
+            "val": TRAIN_SPLIT_WEIGHTS[1],
+            "test": TRAIN_SPLIT_WEIGHTS[2],
+        },
+        "file_list_hash": _manifest_file_list_hash(merged_records),
         "raw_positive_pixels_total": int(merged_records["raw_positive_pixels"].sum()) if not merged_records.empty else 0,
         "grounded_positive_pixels_total": int(merged_records["grounded_positive_pixels"].sum()) if not merged_records.empty else 0,
         "matched_buildings_total": int(merged_records["matched_building_count"].sum()) if not merged_records.empty else 0,
@@ -1110,6 +2194,7 @@ def export_priority_band_dataset(
     min_priority_score: int,
     max_priority_score: int,
     reset_root: bool,
+    imagery_source: str = IMAGERY_SOURCE,
 ) -> tuple[pd.DataFrame, gpd.GeoDataFrame] | None:
     layout = resolve_training_layout(train_root)
     con = connect(resolve_db_path())
@@ -1117,6 +2202,7 @@ def export_priority_band_dataset(
         con,
         min_priority_score=min_priority_score,
         max_priority_score=max_priority_score,
+        dataset_cohort="priority_band",
     )
     osm_pv = load_osm_pv_polygons(con)
     cell_h3_ids = tuple(sorted({str(value) for value in cells["h3_cell_id"].dropna().astype(str).tolist()})) if not cells.empty else ()
@@ -1131,7 +2217,14 @@ def export_priority_band_dataset(
         return None
 
     _prepare_training_root(train_root, reset_root=reset_root)
-    manifest = export_training_dataset(cells, osm_pv, overture_buildings, layout=layout)
+    manifest = export_training_dataset(
+        cells,
+        osm_pv,
+        overture_buildings,
+        layout=layout,
+        imagery_source=imagery_source,
+        dataset_cohort="priority_band",
+    )
     if manifest.empty:
         print(f"no training chips were written for priority band {min_priority_score}..{max_priority_score}.")
         return None
@@ -1141,6 +2234,8 @@ def export_priority_band_dataset(
         layout=layout,
         min_priority_score=min_priority_score,
         max_priority_score=max_priority_score,
+        imagery_source=imagery_source,
+        dataset_cohort="priority_band",
     )
     print(
         f"priority {min_priority_score}..{max_priority_score} export wrote {len(merged_manifest):,} chips to {layout.image_dir}"
@@ -1148,64 +2243,41 @@ def export_priority_band_dataset(
     print(f"manifest: {layout.manifest_path}")
     return merged_manifest, osm_pv
 
+
+# %% [markdown]
+# ## Optional export controls
+#
+# In notebook mode, use the dropdowns below to switch between ESRI and NAIP
+# imagery and between the train pool and the dedicated priority-3 holdout.
+
+# %%
+if _widgets_enabled():
+    _maybe_initialize_training_widgets()
+
 # %%
 if __name__ == "__main__":
+    apply_training_widget_overrides()
     db_path = resolve_db_path()
     print(f"DuckDB: {db_path}")
     print(f"Training root: {TRAIN_ROOT}")
+    print(f"Imagery source: {IMAGERY_SOURCE_LABELS[IMAGERY_SOURCE]}")
+    print(f"Dataset cohort: {DATASET_COHORT_LABELS[DATASET_COHORT]}")
+    print(f"Split policy: {SPLIT_POLICY}")
     print(f"Contextily HTTP cache enabled: {CONTEXTILY_USE_CACHE}")
     print(f"Reuse existing chips: {not OVERWRITE_EXISTING_CHIPS}")
     if not RESET_TRAIN_ROOT:
         print("training root reset disabled: existing image/mask chips will be reused when possible.")
-
-    con = connect(db_path)
-    cells = load_training_cells(con)
-    osm_pv = load_osm_pv_polygons(con)
-    cell_h3_ids = tuple(sorted({str(value) for value in cells["h3_cell_id"].dropna().astype(str).tolist()})) if not cells.empty else ()
-    overture_buildings = load_overture_buildings(con, h3_cell_ids=cell_h3_ids)
-    con.close()
-    train_layout = resolve_training_layout(TRAIN_ROOT)
-
-    print(f"target municipalities: {', '.join(TARGET_MUNICIPALITIES)}")
-    print(f"minimum priority score: {MIN_PRIORITY_SCORE}")
-    if MAX_PRIORITY_SCORE is not None:
-        print(f"maximum priority score: {MAX_PRIORITY_SCORE}")
-    if MAX_TILES_PER_MUNICIPALITY > 0:
-        print(f"per-municipality tile cap: {MAX_TILES_PER_MUNICIPALITY}")
-    if MAX_TILES > 0:
-        print(f"global tile cap: {MAX_TILES}")
-    print(f"selected H3 tiles with OSM PV labels: {len(cells):,}")
-    print(f"OSM rooftop PV polygons: {len(osm_pv):,}")
-    if cells.empty:
-        print("no manifest tiles with OSM PV labels were found; run the manifest builder first.")
-        sys.exit(0)
-    if osm_pv.empty:
-        print("no OSM rooftop PV polygons were found; run the OSM ingestion notebook first.")
-        sys.exit(0)
-    if overture_buildings.empty:
-        print("no Overture buildings were found for the selected training cells; run the Overture ingestion notebook first.")
-        sys.exit(1)
-
-    _prepare_training_root(TRAIN_ROOT, reset_root=RESET_TRAIN_ROOT)
-    manifest = export_training_dataset(cells, osm_pv, overture_buildings, layout=train_layout)
-    if manifest.empty:
-        print("no training chips were written; inspect Contextily connectivity and manifest coverage.")
-        sys.exit(1)
-
-    manifest = write_training_summary(
-        manifest,
-        layout=train_layout,
-        min_priority_score=MIN_PRIORITY_SCORE,
-        max_priority_score=MAX_PRIORITY_SCORE,
-    )
-    print(f"wrote {len(manifest):,} Contextily image chips to {train_layout.image_dir}")
-    print(f"wrote {len(manifest):,} raw binary mask chips to {train_layout.mask_dir}")
-    print(f"wrote {len(manifest):,} grounded mask chips to {train_layout.grounded_mask_dir}")
-    print(f"wrote {len(manifest):,} prompt artifacts to {train_layout.prompt_dir}")
-    if WRITE_REVIEW_ARTIFACTS:
-        print(f"wrote {len(manifest):,} review PNG artifacts to {train_layout.review_dir}")
-    print(f"training manifest: {train_layout.manifest_path}")
-    print("To rebuild from scratch, set GEOAI_RESET_TRAIN_ROOT=1. To widen beyond the seed-neighborhood subset, rerun with GEOAI_MIN_PRIORITY_SCORE=1 and optional municipality/cap overrides.")
+    manifest, osm_pv = run_training_export_workflow()
+    if manifest is not None and not manifest.empty:
+        train_layout = resolve_training_layout(TRAIN_ROOT)
+        print(f"wrote {len(manifest):,} prompt artifacts to {train_layout.prompt_dir}")
+        if WRITE_REVIEW_ARTIFACTS:
+            print(f"wrote {len(manifest):,} review PNG artifacts to {train_layout.review_dir}")
+        print(f"training manifest: {train_layout.manifest_path}")
+        print(
+            "To rebuild from scratch, set GEOAI_RESET_TRAIN_ROOT=1. "
+            "Use GEOAI_IMAGERY_SOURCE=naip for NAIP exports and GEOAI_DATASET_COHORT=holdout_priority3 to export the dedicated seed-neighborhood holdout."
+        )
 
 # %% [markdown]
 # ## Preview exported chips with OSM PV overlays
@@ -1233,6 +2305,7 @@ if __name__ == "__main__" and EXPORT_PRIORITY2_VALIDATION:
         min_priority_score=2,
         max_priority_score=2,
         reset_root=RESET_PRIORITY_BAND_ROOTS,
+        imagery_source=IMAGERY_SOURCE,
     )
     if SHOW_PREVIEW and priority2_result is not None:
         priority2_manifest, priority2_osm_pv = priority2_result
@@ -1252,6 +2325,7 @@ if __name__ == "__main__" and EXPORT_PRIORITY1_VALIDATION:
         min_priority_score=1,
         max_priority_score=1,
         reset_root=RESET_PRIORITY_BAND_ROOTS,
+        imagery_source=IMAGERY_SOURCE,
     )
     if SHOW_PREVIEW and priority1_result is not None:
         priority1_manifest, priority1_osm_pv = priority1_result

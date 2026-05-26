@@ -1,21 +1,22 @@
 # %% [markdown]
-# # STAC Raster Fetch and Occupied-H3 Clip
+# # STAC Raster Fetch and PV-Labelled H3 Clip
 # 
 # Uses the consolidated Puerto Rico STAC catalog from `05_pr_raster_catalog_indexes.py`
-# to fetch every intersecting raster item for occupied H3 cells in San Juan and
-# Isabela, clips each asset to the occupied cell geometry, reprojects to
+# to fetch every intersecting raster item for H3 cells with OSM PV labels,
+# clips each asset to the target cell geometry, reprojects to
 # EPSG:3857, and writes model-ready local derivatives under
 # `data/rasters/stac/local/`.
 
 # %%
-"""07_pr_stac_municipality_fetch.py
+"""08_pr_stac_municipality_fetch.py
 
-Fetch and clip intersecting STAC raster assets for occupied H3 cells.
+Fetch and clip intersecting STAC raster assets for PV-labelled H3 cells.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -51,10 +52,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(PROJECT_ROOT / ".env")
 from utils.census import CANONICAL_COUNTY_TABLE
-from utils.overture import occupied_h3_cells_sql
+from utils.raster_stac_index import resolve_vector_db_path
 
 TARGET_MUNICIPALITIES = ("San Juan", "Isabela")
-OVERTURE_BUILDINGS_TABLE = "pr_overture_buildings"
+PV_TILE_MANIFEST_TABLE = "pr_solar_tile_manifest"
+FETCH_WHOLE_ISLAND = os.getenv("STAC_FETCH_WHOLE_ISLAND", "0") == "1"
 STAC_CATALOG_PATH = PROJECT_ROOT / "data" / "rasters" / "stac" / "pr_raster_catalog_items.parquet"
 LOCAL_STAC_ROOT = PROJECT_ROOT / "data" / "rasters" / "stac" / "local"
 LOCAL_FETCH_MANIFEST_PATH = PROJECT_ROOT / "data" / "rasters" / "stac" / "pr_local_stac_fetch_manifest.parquet"
@@ -88,7 +90,7 @@ def resolve_db_path() -> Path:
         if not path.is_absolute():
             path = PROJECT_ROOT / path if len(path.parts) > 1 else PROJECT_ROOT / "data" / "vectors" / path
         return path
-    return PROJECT_ROOT / "data" / "PR_PV_plan_data.duckdb"
+    return resolve_vector_db_path()
 
 
 def _to_bytes(value: object) -> bytes:
@@ -120,30 +122,65 @@ def table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
     return bool(row and row[0])
 
 
+def table_columns(con: duckdb.DuckDBPyConnection, table_name: str) -> set[str]:
+    rows = con.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = ?;",
+        [table_name],
+    ).fetchall()
+    return {str(row[0]) for row in rows}
+
+
+def active_municipality_scope() -> tuple[str, ...] | None:
+    return None if FETCH_WHOLE_ISLAND else TARGET_MUNICIPALITIES
+
+
 def load_target_h3_cells(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame:
-    if not table_exists(con, OVERTURE_BUILDINGS_TABLE):
+    if not table_exists(con, PV_TILE_MANIFEST_TABLE):
         raise RuntimeError(
-            f"{OVERTURE_BUILDINGS_TABLE} not found; run notebooks/vectors/03_overture_buildings_ingest.py first."
+            f"{PV_TILE_MANIFEST_TABLE} not found; run the H3 tile manifest generation workflow first."
         )
 
-    municipio_sql = ", ".join(f"'{municipio}'" for municipio in TARGET_MUNICIPALITIES)
-    occupied_h3_sql = occupied_h3_cells_sql(OVERTURE_BUILDINGS_TABLE)
+    columns = table_columns(con, PV_TILE_MANIFEST_TABLE)
+    municipio_column = "municipio" if "municipio" in columns else "municipality_name"
+    municipio_geoid_column = "municipio_geoid" if "municipio_geoid" in columns else "municipality_geoid"
+
+    where_parts = ["COALESCE(osm_pv_count, 0) > 0"]
+    params: list[object] = []
+    target_municipalities = active_municipality_scope()
+    if target_municipalities:
+        where_parts.append(f"{municipio_column} IN ({', '.join(['?'] * len(target_municipalities))})")
+        params.extend(target_municipalities)
+
+    h3_resolution_expr = "CAST(h3_resolution AS INTEGER) AS h3_resolution" if "h3_resolution" in columns else "NULL::INTEGER AS h3_resolution"
+    building_count_expr = "CAST(COALESCE(building_count, 0) AS INTEGER) AS building_count" if "building_count" in columns else "0::INTEGER AS building_count"
+    municipality_building_count_expr = (
+        "CAST(COALESCE(municipality_building_count, building_count, 0) AS INTEGER) AS municipality_building_count"
+        if "municipality_building_count" in columns
+        else building_count_expr.replace(" AS building_count", " AS municipality_building_count")
+    )
+    crosses_boundary_expr = (
+        "CAST(COALESCE(crosses_municipality_boundary, FALSE) AS BOOLEAN) AS crosses_municipality_boundary"
+        if "crosses_municipality_boundary" in columns
+        else "FALSE AS crosses_municipality_boundary"
+    )
+
     frame = con.execute(
         f"""
-        WITH occupied_h3 AS ({occupied_h3_sql})
         SELECT
-               h3_cell_id,
-               h3_resolution,
-               municipality_name AS municipio,
-               municipality_geoid AS municipio_geoid,
-               building_count,
-               municipality_building_count,
-               crosses_municipality_boundary,
-               ST_AsWKB(geometry) AS geometry_wkb
-         FROM occupied_h3
-        WHERE municipality_name IN ({municipio_sql})
+            CAST(h3_cell_id AS VARCHAR) AS h3_cell_id,
+            {h3_resolution_expr},
+            CAST({municipio_column} AS VARCHAR) AS municipio,
+            CAST(COALESCE({municipio_geoid_column}, '') AS VARCHAR) AS municipio_geoid,
+            CAST(COALESCE(osm_pv_count, 0) AS INTEGER) AS osm_pv_count,
+            {building_count_expr},
+            {municipality_building_count_expr},
+            {crosses_boundary_expr},
+            ST_AsWKB(geometry) AS geometry_wkb
+        FROM {PV_TILE_MANIFEST_TABLE}
+        WHERE {' AND '.join(where_parts)}
         ORDER BY municipio, h3_cell_id;
-        """
+        """,
+        params,
     ).fetchdf()
     if frame.empty:
         return gpd.GeoDataFrame(
@@ -152,6 +189,7 @@ def load_target_h3_cells(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame:
                 "h3_resolution",
                 "municipio",
                 "municipio_geoid",
+                "osm_pv_count",
                 "building_count",
                 "municipality_building_count",
                 "crosses_municipality_boundary",
@@ -176,13 +214,19 @@ def load_catalog() -> gpd.GeoDataFrame:
     return catalog.to_crs("EPSG:4326")
 
 
-def load_target_municipalities(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame:
+def load_target_municipalities(
+    con: duckdb.DuckDBPyConnection,
+    municipality_names: tuple[str, ...] | None,
+) -> gpd.GeoDataFrame:
     if not table_exists(con, CANONICAL_COUNTY_TABLE):
         raise RuntimeError(
             f"{CANONICAL_COUNTY_TABLE} not found; run notebooks/vectors/01_census_geometries_ingest.py first."
         )
 
-    names_sql = ", ".join("?" * len(TARGET_MUNICIPALITIES))
+    if not municipality_names:
+        return gpd.GeoDataFrame(columns=["municipio", "municipio_geoid", "geometry"], geometry="geometry", crs="EPSG:4326")
+
+    names_sql = ", ".join("?" * len(municipality_names))
     frame = con.execute(
         f"""
         SELECT
@@ -193,7 +237,7 @@ def load_target_municipalities(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFra
         WHERE NAME IN ({names_sql})
         ORDER BY NAME;
         """,
-        list(TARGET_MUNICIPALITIES),
+        list(municipality_names),
     ).fetchdf()
     if frame.empty:
         return gpd.GeoDataFrame(columns=["municipio", "municipio_geoid", "geometry"], geometry="geometry", crs="EPSG:4326")
@@ -302,11 +346,11 @@ def filter_targets_by_manifest(targets: pd.DataFrame, manifest: pd.DataFrame) ->
 
 
 def summarize_building_coverage(
-    occupied_h3_cells: gpd.GeoDataFrame,
+    target_h3_cells: gpd.GeoDataFrame,
     covered_targets: pd.DataFrame,
 ) -> pd.DataFrame:
     total = (
-        occupied_h3_cells[["municipio", "h3_cell_id", "building_count"]]
+        target_h3_cells[["municipio", "h3_cell_id", "building_count"]]
         .drop_duplicates(subset=["municipio", "h3_cell_id"])
         .groupby("municipio", dropna=False)["building_count"]
         .sum()
@@ -345,7 +389,9 @@ def plot_municipality_coverage(
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
 
-    fig, axes = plt.subplots(1, len(municipalities), figsize=(8 * len(municipalities), 8), squeeze=False)
+    ncols = min(4, max(1, len(municipalities)))
+    nrows = int(math.ceil(len(municipalities) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(8 * ncols, 7 * nrows), squeeze=False)
     axes_list = list(axes.flat)
     legend_handles: list[Patch] = []
 
@@ -385,6 +431,9 @@ def plot_municipality_coverage(
             bbox={"facecolor": "white", "alpha": 0.9, "boxstyle": "round,pad=0.4"},
         )
         ax.set_title(municipality.municipio)
+        ax.set_axis_off()
+
+    for ax in axes_list[len(municipalities):]:
         ax.set_axis_off()
 
     if legend_handles:
@@ -1045,21 +1094,24 @@ if __name__ == "__main__":
     con.execute("INSTALL spatial; LOAD spatial;")
     con.execute("LOAD h3;")
 
-    municipalities = load_target_municipalities(con)
-    occupied_h3_cells = load_target_h3_cells(con)
-    print(f"loaded {len(occupied_h3_cells):,} occupied H3 cells for target municipalities")
-    if occupied_h3_cells.empty:
-        print("no occupied H3 cells found in DuckDB.")
+    target_h3_cells = load_target_h3_cells(con)
+    scope_text = "whole-island PV-labelled H3 cells" if FETCH_WHOLE_ISLAND else f"PV-labelled H3 cells for {', '.join(TARGET_MUNICIPALITIES)}"
+    print(f"loaded {len(target_h3_cells):,} {scope_text}")
+    if target_h3_cells.empty:
+        print("no PV-labelled H3 cells found in DuckDB for the requested scope.")
         con.close()
         sys.exit(0)
+
+    municipality_names = tuple(sorted(target_h3_cells["municipio"].dropna().astype(str).unique().tolist()))
+    municipalities = load_target_municipalities(con, municipality_names)
 
     catalog = load_catalog()
     print(f"loaded {len(catalog):,} STAC catalog items from {STAC_CATALOG_PATH}")
 
-    targets = enumerate_target_items(catalog, occupied_h3_cells)
-    print(f"intersecting occupied-H3 tile footprints queued: {len(targets):,}")
+    targets = enumerate_target_items(catalog, target_h3_cells)
+    print(f"intersecting PV-labelled H3 tile footprints queued: {len(targets):,}")
     if targets.empty:
-        print("no intersecting STAC assets were found for the occupied H3 cells.")
+        print("no intersecting STAC assets were found for the requested PV-labelled H3 cells.")
         con.close()
         sys.exit(0)
 
@@ -1165,7 +1217,7 @@ if __name__ == "__main__" and SHOW_COVERAGE_PREVIEW:
         cached_overlay = build_cached_asset_extent_overlay(asset_queue, manifest, municipalities)
         covered_targets = filter_targets_by_manifest(targets, manifest)
         cached_summary = summarize_land_coverage(municipalities, cached_overlay)
-        building_summary = summarize_building_coverage(occupied_h3_cells, covered_targets)
+        building_summary = summarize_building_coverage(target_h3_cells, covered_targets)
         cached_summary = cached_summary.merge(building_summary, on="municipio", how="left")
         for column_name in ("total_buildings", "covered_buildings", "covered_building_pct"):
             if column_name not in cached_summary.columns:

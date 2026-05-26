@@ -38,6 +38,12 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 from utils.geoai_review import render_prediction_review_bundle
 from utils.geoai_preview_sources import collect_naip_stac_preview_rasters
+from utils.geoai_training_contract import (
+    build_training_contract,
+    compare_training_contracts,
+    project_relative_path,
+    training_contract_run_fragment,
+)
 
 
 def _resolve_configured_path(env_name: str, default: Path) -> Path:
@@ -45,6 +51,13 @@ def _resolve_configured_path(env_name: str, default: Path) -> Path:
     if not value:
         return default
     path = Path(value)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _resolve_optional_path(raw_value: str | None) -> Path | None:
+    if not raw_value:
+        return None
+    path = Path(raw_value)
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
@@ -59,7 +72,11 @@ DEFAULT_TRAIN_ROOT = PROJECT_ROOT / "outputs" / "geoai_train_contextily"
 TRAIN_ROOT = _resolve_configured_path("GEOAI_TRAIN_ROOT", DEFAULT_TRAIN_ROOT)
 IMAGES = TRAIN_ROOT / "images"
 MASKS = TRAIN_ROOT / "masks"
-MODEL_OUT = _resolve_configured_path("GEOAI_MODEL_OUT", PROJECT_ROOT / "outputs" / "models")
+BASE_MODEL_ROOT = PROJECT_ROOT / "outputs" / "models" / "detector_finetune"
+EXPLICIT_MODEL_OUT = _resolve_optional_path(os.getenv("GEOAI_MODEL_OUT"))
+EXPLICIT_PREVIEW_ROOT = _resolve_optional_path(os.getenv("GEOAI_PREVIEW_ROOT"))
+MODEL_OUT = EXPLICIT_MODEL_OUT or BASE_MODEL_ROOT / "maskrcnn-resnet50-fpn__e1__b8__lr1em4__v20__data-unresolved"
+DETECTOR_METADATA_PATH = MODEL_OUT / "detector_metadata.json"
 
 NUM_CLASSES = 2        # background + PV
 NUM_EPOCHS = int(os.getenv("GEOAI_NUM_EPOCHS", "1"))
@@ -99,6 +116,204 @@ PREVIEW_EPSILON = float(os.getenv("GEOAI_PREVIEW_EPSILON", "0.2") or "0.2")
 OVERWRITE_PREVIEW_ARTIFACTS = os.getenv("GEOAI_OVERWRITE_PREVIEW_ARTIFACTS", "0") == "1"
 WRITE_STATIC_REVIEW_ARTIFACTS = os.getenv("GEOAI_WRITE_STATIC_REVIEW_ARTIFACTS", "1") == "1"
 WRITE_INTERACTIVE_REVIEW_ARTIFACTS = os.getenv("GEOAI_WRITE_INTERACTIVE_REVIEW_ARTIFACTS", "0") == "1"
+RUN_NAMING_VERSION = 2
+RESUME_TRAINING = os.getenv("GEOAI_RESUME_TRAINING", "0") == "1"
+RESUME_RUN_DIR = _resolve_optional_path(os.getenv("GEOAI_RESUME_RUN_DIR"))
+RESUME_CHECKPOINT = _resolve_optional_path(os.getenv("GEOAI_RESUME_CHECKPOINT"))
+TRAINING_CONTRACT: dict[str, object] | None = None
+
+
+def _slugify(value: object) -> str:
+    text = str(value).strip().lower()
+    slug_chars = [char if char.isalnum() else "-" for char in text]
+    slug = "".join(slug_chars)
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug.strip("-") or "default"
+
+
+def _float_slug(value: float) -> str:
+    if value == 0:
+        return "0"
+    if abs(value) < 0.01:
+        return f"{value:.0e}".replace("e-", "em").replace("e+", "ep")
+    return f"{value:g}".replace(".", "p")
+
+
+def resolve_resume_model_dir() -> Path | None:
+    if RESUME_RUN_DIR is not None:
+        return RESUME_RUN_DIR
+    if RESUME_CHECKPOINT is not None:
+        return RESUME_CHECKPOINT.parent if RESUME_CHECKPOINT.is_file() else RESUME_CHECKPOINT
+    return None
+
+
+def resolve_resume_checkpoint() -> Path | None:
+    if not RESUME_TRAINING:
+        return None
+    if RESUME_CHECKPOINT is not None:
+        return RESUME_CHECKPOINT
+
+    model_dir = resolve_resume_model_dir() or MODEL_OUT
+    if not model_dir.exists():
+        return None
+    try:
+        return find_latest_checkpoint(model_dir)
+    except FileNotFoundError:
+        return None
+
+
+def refresh_runtime_paths() -> None:
+    global MODEL_OUT, PREVIEW_ROOT, DETECTOR_METADATA_PATH
+    resume_model_dir = resolve_resume_model_dir() if RESUME_TRAINING else None
+    if EXPLICIT_MODEL_OUT is not None:
+        model_out = EXPLICIT_MODEL_OUT
+    elif resume_model_dir is not None:
+        model_out = resume_model_dir
+    else:
+        val_slug = f"v{int(round(VAL_SPLIT * 100)):02d}"
+        data_slug = training_contract_run_fragment(TRAINING_CONTRACT)
+        model_out = BASE_MODEL_ROOT / (
+            f"{_slugify(MODEL_NAME)}__e{NUM_EPOCHS}__b{BATCH_SIZE}__lr{_float_slug(LEARNING_RATE)}__{val_slug}__{data_slug}"
+        )
+    MODEL_OUT = model_out
+    PREVIEW_ROOT = EXPLICIT_PREVIEW_ROOT or MODEL_OUT / "preview"
+    DETECTOR_METADATA_PATH = MODEL_OUT / "detector_metadata.json"
+
+
+refresh_runtime_paths()
+
+
+def apply_detector_training_contract(matched_stems: list[str]) -> None:
+    global TRAINING_CONTRACT
+    if TRAIN_MANIFEST.exists():
+        manifest = pd.read_csv(TRAIN_MANIFEST)
+        if "tile_id" in manifest.columns:
+            manifest = manifest[manifest["tile_id"].astype(str).isin(set(matched_stems))].copy()
+    else:
+        image_files = collect_raster_files(IMAGES)
+        mask_files = collect_raster_files(MASKS)
+        manifest = pd.DataFrame.from_records(
+            [
+                {
+                    "tile_id": stem,
+                    "image_path": str(image_files[stem].relative_to(PROJECT_ROOT)),
+                    "raw_mask_path": str(mask_files[stem].relative_to(PROJECT_ROOT)),
+                }
+                for stem in matched_stems
+            ]
+        )
+    if "raw_mask_path" not in manifest.columns and "mask_path" in manifest.columns:
+        manifest["raw_mask_path"] = manifest["mask_path"]
+    manifest = manifest.copy()
+    manifest["split_policy"] = f"random_val_split_{VAL_SPLIT:.2f}"
+    TRAINING_CONTRACT = build_training_contract(
+        manifest,
+        train_root=TRAIN_ROOT,
+        manifest_path=TRAIN_MANIFEST,
+        project_root=PROJECT_ROOT,
+    )
+    TRAINING_CONTRACT["split_policy"] = f"random_val_split_{VAL_SPLIT:.2f}"
+    refresh_runtime_paths()
+
+
+def normalize_model_identity_value(value: object) -> object:
+    if isinstance(value, tuple):
+        return list(value)
+    return value
+
+
+def current_model_identity(num_channels: int) -> dict[str, object]:
+    return {
+        "model_name": MODEL_NAME,
+        "num_channels": num_channels,
+        "num_classes": NUM_CLASSES,
+        "instance_labels": INSTANCE_LABELS,
+        "multiclass": MULTICLASS,
+        "val_split": VAL_SPLIT,
+    }
+
+
+def load_saved_detector_metadata(model_dir: Path) -> dict[str, object]:
+    if not (model_dir / "detector_metadata.json").exists():
+        return {}
+    return json.loads((model_dir / "detector_metadata.json").read_text())
+
+
+def _format_resume_mismatches(mismatches: dict[str, dict[str, object]]) -> str:
+    return "; ".join(
+        f"{key}: current={values['current']!r} saved={values['saved']!r}"
+        for key, values in sorted(mismatches.items())
+    )
+
+
+def ensure_resume_compatible(num_channels: int) -> Path | None:
+    if not RESUME_TRAINING:
+        return None
+
+    resume_checkpoint = resolve_resume_checkpoint()
+    if resume_checkpoint is None or not resume_checkpoint.exists():
+        raise FileNotFoundError(
+            "resume training requested, but no detector checkpoint was found. "
+            "Set GEOAI_RESUME_CHECKPOINT or GEOAI_RESUME_RUN_DIR."
+        )
+
+    resume_model_dir = resolve_resume_model_dir() or resume_checkpoint.parent
+    metadata = load_saved_detector_metadata(resume_model_dir)
+    if metadata:
+        saved_model_identity = {
+            key: normalize_model_identity_value(metadata.get(key))
+            for key in ("model_name", "num_channels", "num_classes", "instance_labels", "multiclass", "val_split")
+            if key in metadata
+        }
+        model_mismatches = {
+            key: {
+                "current": normalize_model_identity_value(current_model_identity(num_channels)[key]),
+                "saved": saved_model_identity[key],
+            }
+            for key in saved_model_identity
+            if normalize_model_identity_value(current_model_identity(num_channels)[key]) != saved_model_identity[key]
+        }
+        if model_mismatches:
+            raise RuntimeError(
+                "detector resume configuration does not match the saved model identity: "
+                + _format_resume_mismatches(model_mismatches)
+            )
+
+        saved_contract = metadata.get("training_contract")
+        if isinstance(saved_contract, dict):
+            contract_mismatches = compare_training_contracts(TRAINING_CONTRACT, saved_contract)
+            if contract_mismatches:
+                raise RuntimeError(
+                    "detector resume configuration does not match the saved training contract: "
+                    + _format_resume_mismatches(contract_mismatches)
+                )
+        else:
+            metadata["training_contract"] = TRAINING_CONTRACT
+            metadata["legacy_training_contract_inferred"] = True
+            (resume_model_dir / "detector_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    return resume_checkpoint
+
+
+def write_detector_metadata(num_channels: int) -> None:
+    MODEL_OUT.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_name": MODEL_OUT.name,
+        "run_naming_version": RUN_NAMING_VERSION,
+        "model_name": MODEL_NAME,
+        "num_channels": num_channels,
+        "num_classes": NUM_CLASSES,
+        "instance_labels": INSTANCE_LABELS,
+        "multiclass": MULTICLASS,
+        "num_epochs": NUM_EPOCHS,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "val_split": VAL_SPLIT,
+        "training_contract": TRAINING_CONTRACT,
+        "resume_training": RESUME_TRAINING,
+        "resume_checkpoint": project_relative_path(resolve_resume_checkpoint(), PROJECT_ROOT),
+    }
+    DETECTOR_METADATA_PATH.write_text(json.dumps(payload, indent=2) + "\n")
 
 
 def selected_model_supports_masks(model_name: str) -> bool:
@@ -460,28 +675,29 @@ def run_geoai_preview(
     }
 
 # %%
-if __name__ == "__main__":
+def run_finetune_workflow() -> None:
     if not IMAGES.exists() or not MASKS.exists():
         print(f"expected training data at {TRAIN_ROOT}; run 09_geoai_training_data first.")
-        sys.exit(0)
+        return
 
     if MODEL_NAME not in MODEL_OPTIONS:
         print(f"unsupported GEOAI_MODEL_NAME={MODEL_NAME!r}")
         print(f"choose one of: {', '.join(MODEL_OPTIONS)}")
-        sys.exit(1)
+        return
 
     if not selected_model_supports_masks(MODEL_NAME):
         print(
             "this notebook stays Mask R-CNN-only for now because the downstream "
             "inference workflow depends on mask outputs."
         )
-        sys.exit(1)
+        return
 
     if not (0.0 < VAL_SPLIT < 1.0):
         raise RuntimeError(f"GEOAI_VAL_SPLIT must be between 0 and 1, got {VAL_SPLIT}.")
 
     matched_stems, num_channels = inspect_dataset(IMAGES, MASKS)
     validate_split_feasibility(len(matched_stems), VAL_SPLIT)
+    apply_detector_training_contract(matched_stems)
     print(f"validated {len(matched_stems):,} clean image/mask pairs under {TRAIN_ROOT}")
 
     device = resolve_device(DEVICE_REQUEST)
@@ -494,7 +710,11 @@ if __name__ == "__main__":
             "the post-training preview cell below remains the supported visualization path."
         )
 
+    resume_checkpoint = ensure_resume_compatible(num_channels)
+    if resume_checkpoint is not None:
+        print(f"resume checkpoint: {resume_checkpoint}")
     MODEL_OUT.mkdir(parents=True, exist_ok=True)
+    write_detector_metadata(num_channels)
 
     import geoai
 
@@ -512,6 +732,8 @@ if __name__ == "__main__":
         val_split=VAL_SPLIT,
         seed=SEED,
         visualize=False,
+        pretrained_model_path=str(resume_checkpoint) if resume_checkpoint is not None else None,
+        resume_training=RESUME_TRAINING,
         device=device,
         num_workers=NUM_WORKERS,
         print_freq=PRINT_FREQ,
@@ -520,6 +742,7 @@ if __name__ == "__main__":
         instance_labels=INSTANCE_LABELS,
         multiclass=MULTICLASS,
     )
+    write_detector_metadata(num_channels)
     print(f"training complete — checkpoints under {MODEL_OUT}")
 
     history_path = find_training_history_path(MODEL_OUT)
@@ -532,6 +755,10 @@ if __name__ == "__main__":
             print("latest training metrics:")
             print(history_summary.tail().to_string(index=False))
         geoai.plot_detection_training_history(str(history_path))
+
+
+if __name__ == "__main__":
+    run_finetune_workflow()
 
 # %% [markdown]
 # ## Preview predictions on training and external tiles

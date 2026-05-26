@@ -560,7 +560,7 @@ def run_sam_benchmark(manifest: pd.DataFrame, requests: pd.DataFrame) -> pd.Data
 
 
 # %%
-if __name__ == "__main__":
+def run_sam_prompt_benchmark_workflow() -> pd.DataFrame | None:
     if SAM_PROMPT_MODE not in VALID_SAM_PROMPT_MODES:
         raise RuntimeError(
             f"unsupported GEOAI_SAM_PROMPT_MODE={SAM_PROMPT_MODE!r}; expected one of {sorted(VALID_SAM_PROMPT_MODES)}"
@@ -570,7 +570,7 @@ if __name__ == "__main__":
     requests = build_prompt_requests(manifest, PROMPT_SPLIT, PROMPT_SAMPLE_COUNT)
     if requests.empty:
         print(f"no prompt benchmark rows found for split={PROMPT_SPLIT!r}")
-        sys.exit(0)
+        return None
 
     legacy_prompt_rows = int(requests["prompt_geometry_kind"].eq("building_footprint").sum())
     if legacy_prompt_rows:
@@ -596,7 +596,7 @@ if __name__ == "__main__":
             "request export and review generation. Install the dependency, then implement the "
             "backend-specific benchmark call path in this notebook."
         )
-        sys.exit(0)
+        return None
 
     if RUN_SAM_BENCHMARK:
         metrics = run_sam_benchmark(manifest, requests)
@@ -617,5 +617,11 @@ if __name__ == "__main__":
                     ]
                 ].to_string(index=False)
             )
+        return metrics
     else:
         print("SAM benchmark execution disabled; set GEOAI_RUN_SAM_BENCHMARK=1 to run SAM3 inference.")
+        return None
+
+
+if __name__ == "__main__":
+    run_sam_prompt_benchmark_workflow()

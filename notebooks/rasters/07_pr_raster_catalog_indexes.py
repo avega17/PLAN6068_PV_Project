@@ -1,26 +1,19 @@
 # %% [markdown]
 # # Puerto Rico Consolidated Raster Catalog and Vector-Guided Preview
-# 
+#
 # This notebook does two jobs:
 # 1. Materialize one final Puerto Rico AOI-filtered raster catalog GeoParquet.
 # 2. Walk through concrete vector-guided previews so we can confirm the catalog is
 #    useful for downstream PV and building chip extraction.
-# 
+#
 # The raster sources stay the same as the current consolidated workflow:
 # - Puerto Rico NAIP via a local STAC GeoParquet built from coastal imagery plus
 #   Microsoft Planetary Computer NAIP items for 2021 through 2024.
 # - Maxar Open Data via remote STAC GeoParquet queried with DuckDB.
 # - Satellogic Earthview via remote STAC GeoParquet queried with DuckDB.
-# 
-# Important note on Maxar filtering:
-# - The current pipeline does **not** keep every item from a Maxar event once an
-#   event intersects Puerto Rico.
-# - The old event-manifest approach is no longer used here.
-# - The new consolidated pipeline queries the public Maxar GeoParquet directly and
-#   only keeps individual STAC items whose footprints intersect the Puerto Rico AOI.
 
 # %%
-"""08_pr_raster_catalog_indexes.py
+"""07_pr_raster_catalog_indexes.py
 
 Jupytext-friendly notebook script for consolidated Puerto Rico raster catalog
 materialization plus vector-guided raster preview steps.
@@ -43,9 +36,9 @@ import rasterio
 from dotenv import load_dotenv
 from IPython.display import display
 from rasterio.enums import Resampling
-from rasterio.windows import Window, from_bounds
+from rasterio.windows import Window, bounds as window_bounds_fn, from_bounds
 from rasterio.warp import transform, transform_bounds
-from shapely.geometry import Point
+from shapely.geometry import Point, box as shapely_box
 
 
 def resolve_project_root(start: Path | None = None) -> Path:
@@ -75,9 +68,11 @@ from utils.raster_stac_index import resolve_vector_db_path
 
 
 OUTPUT_CRS = "EPSG:4326"
+METRIC_CRS = "EPSG:32620"
 USER_SAMPLE_SEED: int | None = None
 BLOCK_PREVIEW_SIZE = 512
 CHIP_SIZE = 512
+CENSUS_UNIT_PREVIEW_SIZE = 1024
 MUNICIPALITY_PV_PREVIEW_LIMIT = 600
 BUILDING_PREVIEW_LIMIT = 600
 PREFERRED_PREVIEW_SOURCES = ["pr_naip", "naip_2021_pr", "maxar_open_data"]
@@ -120,6 +115,16 @@ def table_exists(con, table_name: str) -> bool:
     return bool(row and row[0])
 
 
+def empty_geodataframe(columns: list[str] | None = None) -> gpd.GeoDataFrame:
+    """Return an empty GeoDataFrame in the notebook output CRS."""
+
+    return gpd.GeoDataFrame(
+        columns=columns or ["geometry"],
+        geometry=gpd.GeoSeries([], crs=OUTPUT_CRS),
+        crs=OUTPUT_CRS,
+    )
+
+
 def _to_wkb_bytes(value: object) -> bytes:
     """Normalize WKB values fetched from DuckDB."""
 
@@ -131,7 +136,7 @@ def _to_wkb_bytes(value: object) -> bytes:
 
 
 def fetch_geodataframe(con, query: str, params: list[object] | None = None) -> gpd.GeoDataFrame:
-    """Run a SQL query that returns `geometry_wkb` and convert it to GeoPandas."""
+    """Run a SQL query that returns geometry_wkb and convert it to GeoPandas."""
 
     frame = con.execute(query, params or []).fetchdf()
     if frame.empty:
@@ -146,7 +151,7 @@ def fetch_geodataframe(con, query: str, params: list[object] | None = None) -> g
 
 
 def choose_raster_asset(item_row: pd.Series) -> str | None:
-    """Pick the best raster asset href available for preview/chip extraction."""
+    """Pick the best raster asset href available for preview or chip extraction."""
 
     for column_name in ["visual_asset_href", "analytic_asset_href"]:
         href = item_row.get(column_name)
@@ -197,15 +202,17 @@ def read_raster_preview_from_geometry(
     if asset_href is None:
         return None
 
+    geom_minx, geom_miny, geom_maxx, geom_maxy = geometry.bounds
+    bounds_4326 = (geom_minx, geom_miny, geom_maxx, geom_maxy)
+
     with rasterio.Env(AWS_NO_SIGN_REQUEST="YES"):
         with rasterio.open(asset_href) as src:
-            minx, miny, maxx, maxy = geometry.bounds
+            minx, miny, maxx, maxy = bounds_4326
             if src.crs and src.crs.to_string() != OUTPUT_CRS:
                 minx, miny, maxx, maxy = transform_bounds(OUTPUT_CRS, src.crs, minx, miny, maxx, maxy, densify_pts=21)
 
             window = from_bounds(minx, miny, maxx, maxy, transform=src.transform)
-            full_window = Window(0, 0, src.width, src.height)
-            window = window.intersection(full_window)
+            window = window.intersection(Window(0, 0, src.width, src.height))
             if window.width <= 0 or window.height <= 0:
                 return None
 
@@ -221,6 +228,7 @@ def read_raster_preview_from_geometry(
         "asset_href": asset_href,
         "bands": bands,
         "image": normalize_image(data[0] if len(bands) == 1 else data),
+        "bounds_4326": bounds_4326,
     }
 
 
@@ -261,10 +269,17 @@ def read_raster_chip_at_point(
                 resampling=Resampling.bilinear,
             )
 
+            native_bounds = window_bounds_fn(window, src.transform)
+            if src.crs and src.crs.to_string() != OUTPUT_CRS:
+                chip_bounds_4326 = transform_bounds(src.crs, OUTPUT_CRS, *native_bounds)
+            else:
+                chip_bounds_4326 = native_bounds
+
     return {
         "asset_href": asset_href,
         "bands": bands,
         "image": normalize_image(data[0] if len(bands) == 1 else data),
+        "bounds_4326": chip_bounds_4326,
     }
 
 
@@ -301,19 +316,145 @@ def select_source_candidates(
     return subset.groupby("source", sort=False).head(1).reset_index(drop=True)
 
 
-def row_to_gdf(row: pd.Series) -> gpd.GeoDataFrame:
-    """Wrap a single row with geometry into a one-row GeoDataFrame."""
+def fetch_h3_pv_cells_for_municipality(vector_con, municipality_name: str) -> gpd.GeoDataFrame:
+    """Fetch H3 cells with OSM PV labels for a municipality."""
 
-    return gpd.GeoDataFrame([row], geometry="geometry", crs=OUTPUT_CRS)
+    if not table_exists(vector_con, "pr_solar_tile_manifest"):
+        return empty_geodataframe(["h3_cell_id", "osm_pv_count", "geometry"])
+
+    return fetch_geodataframe(
+        vector_con,
+        """
+        SELECT
+            h3_cell_id,
+            osm_pv_count,
+            ST_AsWKB(geometry) AS geometry_wkb
+        FROM pr_solar_tile_manifest
+        WHERE municipio = ?
+          AND osm_pv_count > 0
+        """,
+        [municipality_name],
+    )
+
+
+def fetch_h3_pv_cells_for_census_unit(vector_con, census_unit_geometry) -> gpd.GeoDataFrame:
+    """Fetch H3 cells with OSM PV labels intersecting a census unit."""
+
+    if not table_exists(vector_con, "pr_solar_tile_manifest"):
+        return empty_geodataframe(["h3_cell_id", "osm_pv_count", "geometry"])
+
+    return fetch_geodataframe(
+        vector_con,
+        """
+        SELECT
+            h3_cell_id,
+            osm_pv_count,
+            ST_AsWKB(geometry) AS geometry_wkb
+        FROM pr_solar_tile_manifest
+        WHERE ST_Intersects(geometry, ST_GeomFromText(?))
+          AND osm_pv_count > 0
+        """,
+        [census_unit_geometry.wkt],
+    )
+
+
+def find_h3_cell_for_point(vector_con, point: Point) -> str | None:
+    """Return the H3 cell whose geometry contains a point."""
+
+    if not table_exists(vector_con, "pr_solar_tile_manifest"):
+        return None
+
+    row = vector_con.execute(
+        """
+        SELECT h3_cell_id
+        FROM pr_solar_tile_manifest
+        WHERE ST_Contains(geometry, ST_GeomFromText(?))
+        LIMIT 1
+        """,
+        [point.wkt],
+    ).fetchone()
+    return row[0] if row else None
+
+
+def compute_area_km2(gdf: gpd.GeoDataFrame) -> float:
+    """Compute area in square kilometers using UTM zone 20N for Puerto Rico."""
+
+    if gdf.empty:
+        return float("nan")
+    return float(gdf.to_crs(METRIC_CRS).geometry.area.iloc[0] / 1_000_000.0)
+
+
+def bounds_to_wkt(bounds_4326: tuple[float, float, float, float]) -> str:
+    """Convert a geographic bounds tuple into WKT polygon text."""
+
+    return shapely_box(*bounds_4326).wkt
+
+
+def overlay_polygons_on_image(
+    ax,
+    image_shape: tuple[int, ...],
+    polygons_gdf: gpd.GeoDataFrame,
+    bounds_4326: tuple[float, float, float, float],
+    *,
+    edgecolor: str,
+    facecolor: str = "none",
+    linewidth: float = 1.5,
+    alpha: float = 0.8,
+) -> None:
+    """Overlay polygon outlines or fills on a raster image in pixel space."""
+
+    if polygons_gdf is None or polygons_gdf.empty:
+        return
+
+    from matplotlib.collections import PatchCollection
+    from matplotlib.patches import Polygon as MplPolygon
+
+    minx, miny, maxx, maxy = bounds_4326
+    if maxx <= minx or maxy <= miny:
+        return
+
+    image_height, image_width = image_shape[:2]
+    patches = []
+
+    def coords_to_pixels(coords) -> np.ndarray:
+        coords_array = np.asarray(coords)
+        x_pixels = ((coords_array[:, 0] - minx) / (maxx - minx)) * image_width
+        y_pixels = (1.0 - ((coords_array[:, 1] - miny) / (maxy - miny))) * image_height
+        return np.column_stack([x_pixels, y_pixels])
+
+    for geom in polygons_gdf.geometry:
+        if geom is None or geom.is_empty:
+            continue
+        parts = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
+        for part in parts:
+            exterior = getattr(part, "exterior", None)
+            if exterior is None:
+                continue
+            patches.append(MplPolygon(coords_to_pixels(exterior.coords), closed=True))
+
+    if not patches:
+        return
+
+    ax.add_collection(
+        PatchCollection(
+            patches,
+            facecolor=facecolor,
+            edgecolor=edgecolor,
+            linewidth=linewidth,
+            alpha=alpha,
+        )
+    )
 
 
 def plot_vector_context(
     municipality_gdf: gpd.GeoDataFrame,
     title: str,
+    *,
     block_gdf: gpd.GeoDataFrame | None = None,
     pv_gdf: gpd.GeoDataFrame | None = None,
     building_gdf: gpd.GeoDataFrame | None = None,
     raster_item_gdf: gpd.GeoDataFrame | None = None,
+    h3_pv_cells_gdf: gpd.GeoDataFrame | None = None,
 ) -> None:
     """Plot a compact vector context panel for notebook inspection."""
 
@@ -322,6 +463,15 @@ def plot_vector_context(
 
     if raster_item_gdf is not None and not raster_item_gdf.empty:
         raster_item_gdf.boundary.plot(ax=ax, color="#2563eb", linewidth=1.1, label="Raster footprint")
+
+    if h3_pv_cells_gdf is not None and not h3_pv_cells_gdf.empty:
+        h3_pv_cells_gdf.boundary.plot(
+            ax=ax,
+            color="#7c3aed",
+            linewidth=0.7,
+            alpha=0.7,
+            label="H3 cells w/ PV labels",
+        )
 
     if block_gdf is not None and not block_gdf.empty:
         block_gdf.boundary.plot(ax=ax, color="#dc2626", linewidth=1.4, label="Sampled census unit")
@@ -340,57 +490,62 @@ def plot_vector_context(
         unique_handles = []
         unique_labels = []
         for handle, label in zip(handles, labels):
-            if label not in seen:
-                seen.add(label)
-                unique_handles.append(handle)
-                unique_labels.append(label)
+            if label in seen:
+                continue
+            seen.add(label)
+            unique_handles.append(handle)
+            unique_labels.append(label)
         ax.legend(unique_handles, unique_labels, loc="upper right")
     plt.show()
 
 
-def plot_raster_preview(preview: dict[str, object], title: str) -> None:
-    """Display a raster preview array."""
+def plot_raster_with_overlay(
+    preview: dict[str, object],
+    title: str,
+    *,
+    overlay_layers: list[dict[str, object]] | None = None,
+    figsize: tuple[int, int] = (8, 8),
+) -> None:
+    """Display a raster preview with optional vector overlays."""
 
-    fig, ax = plt.subplots(figsize=(7, 7), constrained_layout=True)
-    cmap = None if np.asarray(preview["image"]).ndim == 3 else "gray"
-    ax.imshow(preview["image"], cmap=cmap)
+    image = np.asarray(preview["image"])
+    bounds_4326 = preview.get("bounds_4326")
+
+    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+    cmap = None if image.ndim == 3 else "gray"
+    ax.imshow(image, cmap=cmap)
     ax.set_title(title)
     ax.set_axis_off()
-    plt.show()
 
-
-def plot_multiple_raster_previews(
-    previews: list[tuple[pd.Series, dict[str, object]]],
-    title_prefix: str,
-) -> None:
-    """Display one preview panel per sampled raster source."""
-
-    if not previews:
-        print("No readable raster previews were generated.")
-        return
-
-    figure, axes = plt.subplots(1, len(previews), figsize=(6 * len(previews), 6), constrained_layout=True)
-    if len(previews) == 1:
-        axes = [axes]
-
-    for axis, (candidate_row, preview) in zip(axes, previews):
-        cmap = None if np.asarray(preview["image"]).ndim == 3 else "gray"
-        axis.imshow(preview["image"], cmap=cmap)
-        axis.set_title(f"{title_prefix}\n{candidate_row['source']}\n{candidate_row['item_id']}")
-        axis.set_axis_off()
-
+    if overlay_layers and bounds_4326 is not None:
+        for layer in overlay_layers:
+            layer_gdf = layer.get("gdf")
+            if layer_gdf is None or layer_gdf.empty:
+                continue
+            overlay_polygons_on_image(
+                ax,
+                image.shape,
+                layer_gdf,
+                bounds_4326,
+                edgecolor=str(layer.get("edgecolor", "#ff0000")),
+                facecolor=str(layer.get("facecolor", "none")),
+                linewidth=float(layer.get("linewidth", 1.5)),
+                alpha=float(layer.get("alpha", 0.8)),
+            )
     plt.show()
 
 
 def build_geometry_previews(
     candidate_rows: gpd.GeoDataFrame,
     geometry,
+    *,
+    out_size: int = BLOCK_PREVIEW_SIZE,
 ) -> list[tuple[pd.Series, dict[str, object]]]:
     """Read one geometry-based preview for each candidate raster row."""
 
     previews: list[tuple[pd.Series, dict[str, object]]] = []
     for _, candidate_row in candidate_rows.iterrows():
-        preview = read_raster_preview_from_geometry(candidate_row, geometry)
+        preview = read_raster_preview_from_geometry(candidate_row, geometry, out_size=out_size)
         if preview is not None:
             previews.append((candidate_row, preview))
     return previews
@@ -399,6 +554,7 @@ def build_geometry_previews(
 def build_point_chip_previews(
     candidate_rows: gpd.GeoDataFrame,
     point: Point,
+    *,
     chip_size: int = CHIP_SIZE,
 ) -> list[tuple[pd.Series, dict[str, object]]]:
     """Read one point-centered chip preview for each candidate raster row."""
@@ -422,16 +578,9 @@ def choose_lonboard_item(*candidate_frames: gpd.GeoDataFrame) -> pd.Series | Non
             return naip_rows.iloc[0]
     return None
 
+
 # %% [markdown]
 # ## Materialize the Consolidated Puerto Rico Raster Catalog
-# 
-# Output written by this cell:
-# - `data/rasters/stac/pr_naip_items.parquet`
-# - `data/rasters/stac/pr_raster_catalog_items.parquet`
-# 
-# The summary table confirms how many **individual items** survived the Puerto Rico
-# AOI filter per source. For Maxar, that means item footprints intersect Puerto Rico;
-# it does **not** mean we retained every item from a qualifying event collection.
 
 # %%
 SUMMARY_FRAME = asyncio.run(
@@ -446,11 +595,9 @@ SUMMARY_FRAME = asyncio.run(
 display(SUMMARY_FRAME)
 print(f"Consolidated catalog output: {CONSOLIDATED_OUTPUT_PATH}")
 
+
 # %% [markdown]
 # ## Inspect the Consolidated Raster Catalog
-# 
-# Before sampling vectors, we load the catalog itself, confirm source coverage, and
-# preview the item footprints we now have for Puerto Rico.
 
 # %%
 catalog_gdf = gpd.read_parquet(CONSOLIDATED_OUTPUT_PATH)
@@ -483,16 +630,9 @@ ax.set_title("Sample of consolidated Puerto Rico raster footprints by source")
 ax.set_axis_off()
 plt.show()
 
+
 # %% [markdown]
 # ## Sample a Municipality from the Top 10 PV Municipalities
-# 
-# We start from the vector side instead of the raster side. The sample below chooses
-# one municipality from the top 10 by rooftop PV polygon count, then previews that
-# municipality together with a random subset of its PV vectors.
-#
-# Sampling note:
-# - Set `USER_SAMPLE_SEED` near the top of the notebook to reproduce a specific run.
-# - Leave it as `None` to get a fresh seed on each execution.
 
 # %%
 vector_db_path = resolve_vector_db_path()
@@ -513,8 +653,39 @@ top_municipalities = vector_con.execute(
 if top_municipalities.empty:
     raise RuntimeError("No rooftop PV municipalities were found in pr_osm_rooftop_pv_polygons.")
 
-selected_municipality_name = sample_rows(top_municipalities, "top-municipality", n=1).iloc[0]["municipality_name"]
-print(f"Sampled municipality from top 10 PV municipalities: {selected_municipality_name}")
+top_names = top_municipalities["municipality_name"].astype(str).tolist()
+placeholders = ", ".join(["?"] * len(top_names))
+top_municipality_boundaries = fetch_geodataframe(
+    vector_con,
+    f"""
+    SELECT
+        GEOID AS municipality_geoid,
+        NAME AS municipality_name,
+        ST_AsWKB(geometry) AS geometry_wkb
+    FROM pr_census_counties
+    WHERE NAME IN ({placeholders})
+    """,
+    top_names,
+)
+
+municipalities_with_stac: set[str] = set()
+for _, municipality_row in top_municipality_boundaries.iterrows():
+    if catalog_gdf.geometry.intersects(municipality_row.geometry).any():
+        municipalities_with_stac.add(str(municipality_row["municipality_name"]))
+
+top_municipalities_with_stac = top_municipalities[
+    top_municipalities["municipality_name"].isin(municipalities_with_stac)
+].reset_index(drop=True)
+if top_municipalities_with_stac.empty:
+    print("Warning: no top-PV municipality intersects the current STAC catalog; falling back to the full top-10 list.")
+    top_municipalities_with_stac = top_municipalities.copy()
+
+selected_municipality_name = sample_rows(
+    top_municipalities_with_stac,
+    "top-municipality",
+    n=1,
+).iloc[0]["municipality_name"]
+print(f"Sampled municipality (top-10 PV, STAC-intersected when available): {selected_municipality_name}")
 display(top_municipalities)
 
 municipality_gdf = fetch_geodataframe(
@@ -549,18 +720,25 @@ municipality_pv_gdf = sample_rows(
     n=MUNICIPALITY_PV_PREVIEW_LIMIT,
 )
 
-plot_vector_context(
-    municipality_gdf=municipality_gdf,
-    title=f"{selected_municipality_name}: municipality boundary with sampled rooftop PV polygons",
-    pv_gdf=municipality_pv_gdf,
+municipality_geometry = municipality_gdf.geometry.iloc[0]
+municipality_stac_gdf = catalog_gdf[catalog_gdf.geometry.intersects(municipality_geometry)].copy()
+municipality_h3_pv_gdf = fetch_h3_pv_cells_for_municipality(vector_con, selected_municipality_name)
+print(
+    f"STAC footprints intersecting municipality: {len(municipality_stac_gdf)}, "
+    f"H3 PV-labelled cells: {len(municipality_h3_pv_gdf)}"
 )
+
+plot_vector_context(
+    municipality_gdf,
+    f"{selected_municipality_name}: boundary, STAC footprints, H3 PV cells, sampled PV polygons",
+    pv_gdf=municipality_pv_gdf,
+    raster_item_gdf=municipality_stac_gdf if not municipality_stac_gdf.empty else None,
+    h3_pv_cells_gdf=municipality_h3_pv_gdf if not municipality_h3_pv_gdf.empty else None,
+)
+
 
 # %% [markdown]
 # ## Sample a Census Unit Inside that Municipality
-# 
-# The current workspace uses census tracts and block groups. There is no census
-# block table in this project, so the finer sampled census unit is always drawn
-# from `pr_census_block_groups`.
 
 # %%
 census_unit_table = "pr_census_block_groups"
@@ -571,7 +749,7 @@ sampled_census_unit_gdf = fetch_geodataframe(
     f"""
     SELECT
         g.GEOID AS census_unit_geoid,
-        coalesce(g.NAME, g.GEOID) AS census_unit_name,
+        COALESCE(g.NAME, g.GEOID) AS census_unit_name,
         ST_AsWKB(g.geometry) AS geometry_wkb
     FROM {census_unit_table} AS g
     JOIN pr_census_counties AS m
@@ -589,9 +767,30 @@ sampled_census_unit_gdf = sample_rows(
 if sampled_census_unit_gdf.empty:
     raise RuntimeError(f"No sampled {census_unit_label} was found inside {selected_municipality_name}.")
 
+census_display_name = str(sampled_census_unit_gdf.iloc[0].get("census_unit_name") or "").strip()
+if not census_display_name:
+    census_display_name = str(sampled_census_unit_gdf.iloc[0].get("census_unit_geoid", "Unknown"))
+
+if census_display_name == str(sampled_census_unit_gdf.iloc[0].get("census_unit_geoid", "")):
+    try:
+        import osmnx as ox
+
+        osmnx_match = ox.geocode_to_gdf(f"{selected_municipality_name}, Puerto Rico")
+        if not osmnx_match.empty:
+            fallback_name = str(osmnx_match.iloc[0].get("display_name", "")).split(",")[0].strip()
+            if fallback_name:
+                census_display_name = fallback_name
+    except Exception:
+        pass
+
+census_area_km2 = compute_area_km2(sampled_census_unit_gdf)
+
 print(f"Using census geography table: {census_unit_table} ({census_unit_label})")
+print(f"Census unit common name : {census_display_name}")
+print(f"Census unit area        : {census_area_km2:.3f} km^2")
 display(sampled_census_unit_gdf.drop(columns="geometry"))
 
+sampled_census_unit_geometry = sampled_census_unit_gdf.geometry.iloc[0]
 block_pv_gdf = fetch_geodataframe(
     vector_con,
     """
@@ -599,31 +798,26 @@ block_pv_gdf = fetch_geodataframe(
         feature_id,
         municipality_name,
         municipality_geoid,
-        ST_AsWKB(pv.geometry) AS geometry_wkb
-    FROM pr_osm_rooftop_pv_polygons AS pv
-    WHERE ST_Intersects(pv.geometry, ST_GeomFromText(?))
+        ST_AsWKB(geometry) AS geometry_wkb
+    FROM pr_osm_rooftop_pv_polygons
+    WHERE ST_Intersects(geometry, ST_GeomFromText(?))
     """,
-    [sampled_census_unit_gdf.geometry.iloc[0].wkt],
+    [sampled_census_unit_geometry.wkt],
 )
 block_pv_gdf = sample_rows(block_pv_gdf, "block-group-pv-preview", n=300)
 
 plot_vector_context(
-    municipality_gdf=municipality_gdf,
+    municipality_gdf,
+    f"Sampled {census_unit_label} inside {selected_municipality_name}",
     block_gdf=sampled_census_unit_gdf,
     pv_gdf=block_pv_gdf,
-    title=f"Sampled {census_unit_label} inside {selected_municipality_name}",
 )
+
 
 # %% [markdown]
 # ## Sample a Raster Item that Intersects the Census Unit
-# 
-# This is the first raster preview that is directly anchored to already-fetched
-# vector data. We search the local consolidated catalog for items whose footprint
-# intersects the sampled census unit, rank candidates by smaller `gsd` and newer
-# acquisition time, then preview the chosen raster against the same vector context.
 
 # %%
-sampled_census_unit_geometry = sampled_census_unit_gdf.geometry.iloc[0]
 raster_candidates_for_unit = sort_catalog_candidates(
     catalog_gdf[catalog_gdf.geometry.intersects(sampled_census_unit_geometry)].copy()
 )
@@ -641,32 +835,45 @@ if raster_candidates_for_unit.empty:
 print(f"Sampled raster sources for the {census_unit_label}: {', '.join(raster_candidates_for_unit['source'].tolist())}")
 
 plot_vector_context(
-    municipality_gdf=municipality_gdf,
+    municipality_gdf,
+    f"Raster footprint intersecting sampled {census_unit_label}",
     block_gdf=sampled_census_unit_gdf,
     pv_gdf=block_pv_gdf,
     raster_item_gdf=raster_candidates_for_unit,
-    title=f"Raster footprint intersecting sampled {census_unit_label}",
 )
 
-unit_raster_previews = build_geometry_previews(raster_candidates_for_unit, sampled_census_unit_geometry)
+unit_raster_previews = build_geometry_previews(
+    raster_candidates_for_unit,
+    sampled_census_unit_geometry,
+    out_size=CENSUS_UNIT_PREVIEW_SIZE,
+)
 if not unit_raster_previews:
     print("No readable raster preview asset was available for the sampled census unit.")
 else:
-    plot_multiple_raster_previews(
-        unit_raster_previews,
-        title_prefix=f"Raster preview over sampled {census_unit_label}",
-    )
     print("Readable raster preview assets for the sampled census unit:")
     for candidate_row, preview in unit_raster_previews:
         print(f"- {candidate_row['source']}: {preview['asset_href']}")
+        plot_raster_with_overlay(
+            preview,
+            (
+                f"Raster preview ({CENSUS_UNIT_PREVIEW_SIZE}px) over sampled {census_unit_label}\n"
+                f"{candidate_row['source']} - {candidate_row['item_id']}"
+            ),
+            overlay_layers=[
+                {
+                    "gdf": sampled_census_unit_gdf,
+                    "edgecolor": "#dc2626",
+                    "facecolor": "none",
+                    "linewidth": 2.0,
+                    "alpha": 0.9,
+                }
+            ],
+            figsize=(9, 9),
+        )
+
 
 # %% [markdown]
 # ## Fetch an NxN Raster Chip from a Sampled Solar Panel Centroid
-# 
-# We now move from polygon-overlap preview to point-centered chip extraction. The
-# sampled solar panel vector is drawn from the same census unit when possible, and
-# the STAC search is performed against the local consolidated catalog using the
-# centroid point.
 
 # %%
 sampled_pv_gdf = fetch_geodataframe(
@@ -704,10 +911,9 @@ if sampled_pv_gdf.empty:
     raise RuntimeError("No sampled rooftop PV vector was found for centroid chip extraction.")
 
 pv_centroid = sampled_pv_gdf.geometry.iloc[0].centroid
-pv_point_candidates = sort_catalog_candidates(
-    catalog_gdf[catalog_gdf.geometry.intersects(pv_centroid)].copy()
-)
+pv_point_candidates = sort_catalog_candidates(catalog_gdf[catalog_gdf.geometry.intersects(pv_centroid)].copy())
 pv_point_candidates = select_source_candidates(pv_point_candidates)
+
 display(
     pv_point_candidates[
         ["source", "item_id", "collection_id", "acquired_at", "gsd", "visual_asset_href", "analytic_asset_href"]
@@ -718,37 +924,93 @@ if pv_point_candidates.empty:
     raise RuntimeError("No raster items intersected the sampled rooftop PV centroid.")
 
 plot_vector_context(
-    municipality_gdf=municipality_gdf,
+    municipality_gdf,
+    "Sampled PV polygon centroid with matching raster footprint",
     block_gdf=sampled_census_unit_gdf,
     pv_gdf=sampled_pv_gdf,
     raster_item_gdf=pv_point_candidates,
-    title="Sampled PV polygon centroid with matching raster footprint",
 )
+
+census_unit_h3_pv_gdf = fetch_h3_pv_cells_for_census_unit(vector_con, sampled_census_unit_geometry)
+selected_h3_cell_id = find_h3_cell_for_point(vector_con, pv_centroid)
+
+if not census_unit_h3_pv_gdf.empty:
+    fig, ax = plt.subplots(figsize=(8, 8), constrained_layout=True)
+    sampled_census_unit_gdf.boundary.plot(ax=ax, color="#0f172a", linewidth=1.2, label="Census unit")
+    census_unit_h3_pv_gdf.boundary.plot(
+        ax=ax,
+        color="#7c3aed",
+        linewidth=0.8,
+        alpha=0.7,
+        label="H3 cells w/ PV labels",
+    )
+    if selected_h3_cell_id:
+        selected_h3_gdf = census_unit_h3_pv_gdf[census_unit_h3_pv_gdf["h3_cell_id"] == selected_h3_cell_id]
+        if not selected_h3_gdf.empty:
+            selected_h3_gdf.plot(
+                ax=ax,
+                color="#facc15",
+                edgecolor="#d97706",
+                linewidth=1.5,
+                alpha=0.6,
+                label="Selected H3 cell",
+            )
+    sampled_pv_gdf.plot(ax=ax, color="#f97316", alpha=0.7, linewidth=0.5, label="Sampled PV polygon")
+    ax.set_title(f"H3 PV-labelled cells in sampled {census_unit_label}")
+    ax.set_axis_off()
+    handles, labels = ax.get_legend_handles_labels()
+    if labels:
+        ax.legend(handles, labels, loc="upper right")
+    plt.show()
+    print(f"H3 cells with PV labels in census unit: {len(census_unit_h3_pv_gdf)}")
+    print(f"H3 cell containing PV centroid: {selected_h3_cell_id or 'none found'}")
+else:
+    print("No H3 PV-labelled cells found in this census unit.")
 
 pv_chip_previews = build_point_chip_previews(pv_point_candidates, pv_centroid, chip_size=CHIP_SIZE)
 if not pv_chip_previews:
     print("No readable raster chip asset was available for the sampled PV centroid.")
 else:
-    plot_multiple_raster_previews(
-        pv_chip_previews,
-        title_prefix=f"{CHIP_SIZE}x{CHIP_SIZE} chip centered on sampled PV centroid",
-    )
     print("Readable raster chip assets for the sampled PV centroid:")
     for candidate_row, preview in pv_chip_previews:
         print(f"- {candidate_row['source']}: {preview['asset_href']}")
+        local_pv_gdf = fetch_geodataframe(
+            vector_con,
+            """
+            SELECT
+                feature_id,
+                municipality_name,
+                municipality_geoid,
+                ST_AsWKB(geometry) AS geometry_wkb
+            FROM pr_osm_rooftop_pv_polygons
+            WHERE ST_Intersects(geometry, ST_GeomFromText(?))
+            """,
+            [bounds_to_wkt(preview["bounds_4326"])],
+        )
+        plot_raster_with_overlay(
+            preview,
+            f"{CHIP_SIZE}x{CHIP_SIZE} PV chip - {candidate_row['source']}\nPV labels overlaid in orange",
+            overlay_layers=[
+                {
+                    "gdf": local_pv_gdf,
+                    "edgecolor": "#ea580c",
+                    "facecolor": "#f97316",
+                    "linewidth": 1.1,
+                    "alpha": 0.55,
+                }
+            ]
+            if not local_pv_gdf.empty
+            else None,
+        )
+
 
 # %% [markdown]
 # ## Sample NxN Raster Chips from a Building Footprint Centroid
-# 
-# The final step repeats the centroid-driven search with Overture building
-# footprints. Instead of taking only one best item overall, we keep one best chip
-# per source so we can compare how the same building context looks across the
-# intersecting raster datasets we have available.
 
 # %%
 sampled_building_gdf = fetch_geodataframe(
     vector_con,
-    f"""
+    """
     SELECT
         id AS building_id,
         municipality_name,
@@ -764,7 +1026,7 @@ sampled_building_gdf = sample_rows(sampled_building_gdf, "block-group-building-c
 if sampled_building_gdf.empty:
     sampled_building_gdf = fetch_geodataframe(
         vector_con,
-        f"""
+        """
         SELECT
             id AS building_id,
             municipality_name,
@@ -797,36 +1059,61 @@ display(
 )
 
 plot_vector_context(
-    municipality_gdf=municipality_gdf,
+    municipality_gdf,
+    "Sampled building centroid with best intersecting raster item per source",
     block_gdf=sampled_census_unit_gdf,
     building_gdf=sampled_building_gdf,
     raster_item_gdf=building_point_candidates,
-    title="Sampled building centroid with best intersecting raster item per source",
 )
 
 if building_point_candidates.empty:
     print("No intersecting raster items were found for the sampled building centroid.")
 else:
-    previews = build_point_chip_previews(building_point_candidates, sampled_building_centroid, chip_size=CHIP_SIZE)
-
-    if not previews:
-        print("Intersecting raster items were found, but none exposed a readable preview/chip asset.")
+    building_chip_previews = build_point_chip_previews(
+        building_point_candidates,
+        sampled_building_centroid,
+        chip_size=CHIP_SIZE,
+    )
+    if not building_chip_previews:
+        print("Intersecting raster items were found, but none exposed a readable preview or chip asset.")
     else:
-        plot_multiple_raster_previews(
-            previews,
-            title_prefix=f"{CHIP_SIZE}x{CHIP_SIZE} building-centroid chip",
-        )
         print("Readable chip assets used for the building centroid preview:")
-        for candidate_row, preview in previews:
+        for candidate_row, preview in building_chip_previews:
             print(f"- {candidate_row['source']}: {preview['asset_href']}")
+            local_buildings_gdf = fetch_geodataframe(
+                vector_con,
+                """
+                SELECT
+                    id AS building_id,
+                    ST_AsWKB(geometry) AS geometry_wkb
+                FROM pr_overture_buildings
+                WHERE ST_Intersects(geometry, ST_GeomFromText(?))
+                """,
+                [bounds_to_wkt(preview["bounds_4326"])],
+            )
+            if not local_buildings_gdf.empty:
+                local_buildings_gdf = sample_rows(
+                    local_buildings_gdf,
+                    f"building-overlay-{candidate_row['source']}-{candidate_row['item_id']}",
+                    n=BUILDING_PREVIEW_LIMIT,
+                )
+            plot_raster_with_overlay(
+                preview,
+                f"{CHIP_SIZE}x{CHIP_SIZE} building chip - {candidate_row['source']}\nBuilding footprints overlaid in green",
+                overlay_layers=[
+                    {
+                        "gdf": local_buildings_gdf if not local_buildings_gdf.empty else sampled_building_gdf,
+                        "edgecolor": "#10b981",
+                        "facecolor": "none",
+                        "linewidth": 1.5,
+                        "alpha": 0.9,
+                    }
+                ],
+            )
 
 
 # %% [markdown]
 # ## Explore a Full NAIP COG in Lonboard
-#
-# This final cell uses Lonboard's COG support so the full raster can be explored
-# interactively with pan and zoom. We use a sampled NAIP item because its public
-# HTTPS COG is the simplest match for the Lonboard + Async-GeoTIFF workflow.
 
 # %%
 lonboard_item = choose_lonboard_item(raster_candidates_for_unit, pv_point_candidates, building_point_candidates)
@@ -847,7 +1134,6 @@ else:
         print(f"Lonboard COG asset: {naip_asset_href}")
 
         async def open_lonboard_geotiff(cog_href: str):
-            # Mount the full signed asset URL so each range request keeps the SAS token.
             return await GeoTIFF.open("", store=HTTPStore(cog_href))
 
         geotiff = asyncio.run(open_lonboard_geotiff(naip_asset_href))
@@ -875,43 +1161,77 @@ else:
             return EncodedImage(data=buffer.getvalue(), media_type="image/png")
 
         lonboard_layer = RasterLayer.from_geotiff(geotiff, render_tile=render_tile)
-        display(Map(layers=[lonboard_layer], height=800))
+        layers = [lonboard_layer]
+
+        try:
+            from lonboard import HeatmapLayer
+
+            heatmap_layer = None
+            if table_exists(vector_con, "pr_solar_tile_manifest"):
+                h3_cog_gdf = fetch_geodataframe(
+                    vector_con,
+                    """
+                    SELECT
+                        h3_cell_id,
+                        osm_pv_count,
+                        ST_AsWKB(ST_Centroid(geometry)) AS geometry_wkb
+                    FROM pr_solar_tile_manifest
+                    WHERE ST_Intersects(geometry, ST_GeomFromText(?))
+                      AND osm_pv_count > 0
+                    """,
+                    [lonboard_item.geometry.wkt],
+                )
+                if h3_cog_gdf.empty:
+                    print("No H3 PV-labelled cells found intersecting this COG footprint; HeatmapLayer skipped.")
+                else:
+                    print(
+                        f"Building HeatmapLayer from {len(h3_cog_gdf)} H3 cells "
+                        f"(osm_pv_count total: {int(h3_cog_gdf['osm_pv_count'].sum())})."
+                    )
+                    heatmap_layer = HeatmapLayer.from_geopandas(
+                        h3_cog_gdf[["geometry", "osm_pv_count"]],
+                        get_weight="osm_pv_count",
+                        radius_pixels=40,
+                        intensity=1.5,
+                        opacity=0.65,
+                        aggregation="SUM",
+                    )
+            else:
+                print("pr_solar_tile_manifest table not found; HeatmapLayer skipped.")
+
+            if heatmap_layer is not None:
+                layers.append(heatmap_layer)
+        except ImportError:
+            print("HeatmapLayer is not available in this lonboard version; displaying raster only.")
+        except Exception as exc:
+            print(f"HeatmapLayer construction failed: {type(exc).__name__}: {exc}")
+
+        display(Map(layers=layers, height=800))
     except ImportError as exc:
         print(f"Lonboard full-COG preview requires extra packages that are not installed: {exc}")
     except Exception as exc:
         print(f"Lonboard full-COG preview failed: {type(exc).__name__}: {exc}")
 
+
 # %% [markdown]
 # ## Reference Notes for Follow-on Raster Preview Work
-# 
-# These references are the ones requested for retrieval, and they are the main
-# patterns worth carrying into later notebook expansion:
-# 
+#
 # 1. Planetary Computer STAC quickstart
-#    - `bbox` and `intersects` are the key search patterns.
-#    - Treat STAC items as GeoJSON and convert them into GeoDataFrames for quick
-#      metadata analysis.
-#    - Item assets can be inspected directly and opened with libraries such as
-#      `rioxarray` or `rasterio`.
-# 
+#    - bbox and intersects are the key search patterns.
+#    - Treat STAC items as GeoJSON and convert them into GeoDataFrames for quick metadata analysis.
+#    - Item assets can be inspected directly and opened with libraries such as rioxarray or rasterio.
+#
 # 2. EODC thumbnail creation with TiTiler
-#    - A preview image can be built from a COG URL using a `/cog/preview` endpoint
-#      with parameters such as `rescale`, `nodata`, and `dst_crs`.
-#    - That pattern is useful if we want richer remote thumbnails without reading
-#      raster windows directly in Python.
-# 
+#    - A preview image can be built from a COG URL using a /cog/preview endpoint with parameters such as rescale, nodata, and dst_crs.
+#    - That pattern is useful if we want richer remote thumbnails without reading raster windows directly in Python.
+#
 # 3. Lonboard COG rendering
-#    - `RasterLayer.from_geotiff(...)` now supports streaming COG tiles on demand.
-#    - This is a strong next step if we want interactive browser-side inspection of
-#      candidate raster items without standing up a tile server.
-# 
+#    - RasterLayer.from_geotiff(...) supports streaming COG tiles on demand.
+#    - This is a strong next step if we want interactive browser-side inspection of candidate raster items without standing up a tile server.
+#
 # 4. STAC + xarray + dask
-#    - `odc.stac.load(...)` is the main pattern for multi-item raster cubes when we
-#      need more than single-scene preview or chip extraction.
-#    - That is more appropriate for temporal stacks or model-ready raster tensors
-#      than for lightweight notebook previews.
+#    - odc.stac.load(...) is the main pattern for multi-item raster cubes when we need more than single-scene preview or chip extraction.
+#    - That is more appropriate for temporal stacks or model-ready raster tensors than for lightweight notebook previews.
 
 # %%
 vector_con.close()
-
-

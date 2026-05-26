@@ -41,7 +41,7 @@ duckdb-engine
 # scikit-image
 # opencv-python
 scikit-learn
-geoai-py
+geoai-py==0.39.2
 segment-geospatial[samgeo3]
 # torch>=2.12
 
@@ -56,9 +56,9 @@ google-maps-solar
 # STAC-specific
 pystac
 pystac-client
-stac-geoparquet==0.7.0
+stac-geoparquet>=0.7.0
 # rustac==0.9.6
-rustac[arrow]==0.9.6
+rustac[arrow]>=0.9.6
 planetary-computer
 
 

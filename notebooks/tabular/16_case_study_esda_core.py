@@ -1,10 +1,10 @@
 # %% [markdown]
 # # Case-Study ESDA Core Draft
 #
-# Implements the BG-first ESDA path for San Juan and Isabela once the block-
-# group aggregate surface exists. The notebook focuses on the core 3-day sprint:
+# Implements the tract-based ESDA path for San Juan and Isabela once the tract
+# aggregate surface exists. The notebook focuses on the core 3-day sprint:
 #
-# - audited BG analysis surface loading,
+# - audited tract analysis surface loading,
 # - outcome-versus-covariate Pearson and Spearman correlations,
 # - per-municipality global Moran's I,
 # - one Queen-versus-Rook sensitivity check, and
@@ -52,18 +52,28 @@ load_dotenv(PROJECT_ROOT / ".env")
 from utils.census import resolve_vector_db_path
 
 TARGET_MUNICIPALITIES = ("San Juan", "Isabela")
-BG_AGG_TABLE = "pr_pv_bg_aggregates"
-BG_AGG_CSV_PATH = PROJECT_ROOT / "outputs" / "figures" / "pv_bg_aggregates_sj_isabela.csv"
-PRIMARY_OUTCOME_CANDIDATES = ("any_pv_signal_rate", "detected_pv_rate", "osm_pv_rate")
-SENSITIVITY_OUTCOME_CANDIDATES = ("detected_pv_rate", "osm_pv_rate")
+AGG_TABLE = "pr_pv_tract_aggregates"
+AGG_CSV_PATH = PROJECT_ROOT / "outputs" / "figures" / "pv_tract_aggregates_sj_isabela.csv"
+GEOGRAPHY_TABLE = "pr_census_tracts"
+GEOGRAPHY_ID_COLUMN = "tract_geoid"
+PRIMARY_OUTCOME_CANDIDATES = (
+    "any_pv_evidence_buildings_per_1000",
+    "detected_pv_buildings_per_1000",
+    "osm_labeled_buildings_per_1000",
+)
+SENSITIVITY_OUTCOME_CANDIDATES = (
+    "detected_pv_buildings_per_1000",
+    "osm_labeled_buildings_per_1000",
+)
 CONTEXTUAL_COVARIATES = (
-    "annual_flux_mean_kwh_per_kw_yr",
-    "nsrdb_ghi_mean",
+    "nsrdb_multiyear_ghi_mean",
     "median_household_income_usd",
     "pct_bachelor_plus",
     "pct_owner_occupied",
-    "diversity_index",
-    "pct_urban_population",
+    "pct_spanish_english_well_18_64",
+    "pct_spanish_english_not_at_all_18_64",
+    "cdc_svi_2020_overall_percentile",
+    "pct_urban_land_area",
 )
 LISA_SIGNIFICANCE = float(os.getenv("CASE_STUDY_LISA_SIGNIFICANCE", "0.05") or "0.05")
 MORAN_PERMUTATIONS = int(os.getenv("CASE_STUDY_MORAN_PERMUTATIONS", "999") or "999")
@@ -97,11 +107,11 @@ def _to_bytes(value: object) -> bytes:
     return bytes(value)
 
 
-def load_bg_analysis_surface(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame:
+def load_analysis_surface(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame:
     has_table = bool(
         con.execute(
             "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?;",
-            [BG_AGG_TABLE],
+            [AGG_TABLE],
         ).fetchone()[0]
     )
     names_sql = ", ".join("?" * len(TARGET_MUNICIPALITIES))
@@ -111,41 +121,41 @@ def load_bg_analysis_surface(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame
             f"""
             SELECT
                 agg.*,
-                ST_AsWKB(bg.geometry) AS geometry_wkb
-            FROM {BG_AGG_TABLE} AS agg
-            JOIN pr_census_block_groups AS bg
-              ON bg.GEOID = agg.bg_geoid
+                ST_AsWKB(geom.geometry) AS geometry_wkb
+            FROM {AGG_TABLE} AS agg
+            JOIN {GEOGRAPHY_TABLE} AS geom
+              ON geom.GEOID = agg.{GEOGRAPHY_ID_COLUMN}
             WHERE agg.municipio IN ({names_sql})
-            ORDER BY agg.municipio, agg.bg_geoid;
+            ORDER BY agg.municipio, agg.{GEOGRAPHY_ID_COLUMN};
             """,
             list(TARGET_MUNICIPALITIES),
         ).fetchdf()
-    elif BG_AGG_CSV_PATH.exists():
-        bg_frame = pd.read_csv(BG_AGG_CSV_PATH)
-        if bg_frame.empty:
-            raise RuntimeError(f"{BG_AGG_CSV_PATH} exists but is empty.")
-        con.register("staged_bg_analysis_surface", bg_frame)
+    elif AGG_CSV_PATH.exists():
+        agg_frame = pd.read_csv(AGG_CSV_PATH)
+        if agg_frame.empty:
+            raise RuntimeError(f"{AGG_CSV_PATH} exists but is empty.")
+        con.register("staged_analysis_surface", agg_frame)
         frame = con.execute(
             f"""
             SELECT
-                staged_bg_analysis_surface.*,
-                ST_AsWKB(bg.geometry) AS geometry_wkb
-            FROM staged_bg_analysis_surface
-            JOIN pr_census_block_groups AS bg
-              ON bg.GEOID = staged_bg_analysis_surface.bg_geoid
-            WHERE staged_bg_analysis_surface.municipio IN ({names_sql})
-            ORDER BY staged_bg_analysis_surface.municipio, staged_bg_analysis_surface.bg_geoid;
+                staged_analysis_surface.*,
+                ST_AsWKB(geom.geometry) AS geometry_wkb
+            FROM staged_analysis_surface
+            JOIN {GEOGRAPHY_TABLE} AS geom
+              ON geom.GEOID = staged_analysis_surface.{GEOGRAPHY_ID_COLUMN}
+            WHERE staged_analysis_surface.municipio IN ({names_sql})
+            ORDER BY staged_analysis_surface.municipio, staged_analysis_surface.{GEOGRAPHY_ID_COLUMN};
             """,
             list(TARGET_MUNICIPALITIES),
         ).fetchdf()
-        con.unregister("staged_bg_analysis_surface")
+        con.unregister("staged_analysis_surface")
     else:
         raise RuntimeError(
-            f"Neither {BG_AGG_TABLE} nor {BG_AGG_CSV_PATH} is available. Rebuild the BG aggregate first."
+            f"Neither {AGG_TABLE} nor {AGG_CSV_PATH} is available. Rebuild the tract aggregate first."
         )
 
     if frame.empty:
-        raise RuntimeError("No BG analysis rows were available for San Juan and Isabela.")
+        raise RuntimeError("No tract analysis rows were available for San Juan and Isabela.")
 
     geometry = gpd.GeoSeries.from_wkb(frame["geometry_wkb"].map(_to_bytes), crs="EPSG:4326")
     return gpd.GeoDataFrame(frame.drop(columns=["geometry_wkb"]), geometry=geometry, crs="EPSG:4326")
@@ -174,13 +184,13 @@ def _valid_numeric_pair(frame: pd.DataFrame, x_column: str, y_column: str) -> pd
 
 
 def build_correlation_table(
-    bg_gdf: gpd.GeoDataFrame,
+    analysis_gdf: gpd.GeoDataFrame,
     *,
     outcome_column: str,
     covariates: list[str],
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
-    scopes = [("pooled", bg_gdf)] + [(municipio, subset.copy()) for municipio, subset in bg_gdf.groupby("municipio", sort=False)]
+    scopes = [("pooled", analysis_gdf)] + [(municipio, subset.copy()) for municipio, subset in analysis_gdf.groupby("municipio", sort=False)]
 
     for scope_name, scope_frame in scopes:
         for covariate in covariates:
@@ -219,7 +229,7 @@ def classify_lisa_cluster(quadrant: int, p_value: float, significance: float = L
 
 
 def run_global_moran(
-    bg_gdf: gpd.GeoDataFrame,
+    analysis_gdf: gpd.GeoDataFrame,
     *,
     value_column: str,
     weight_kind: str,
@@ -230,7 +240,7 @@ def run_global_moran(
     rows: list[dict[str, object]] = []
     weight_factory = Queen if weight_kind == "queen" else Rook
 
-    for municipio, subset in bg_gdf.groupby("municipio", sort=False):
+    for municipio, subset in analysis_gdf.groupby("municipio", sort=False):
         subset = subset[subset[value_column].notna()].copy()
         if len(subset) < 5:
             continue
@@ -242,7 +252,7 @@ def run_global_moran(
                 "metric": value_column,
                 "municipio": municipio,
                 "weights": weight_kind,
-                "n_bgs": int(len(subset)),
+                "n_tracts": int(len(subset)),
                 "morans_I": float(moran.I),
                 "p_sim": float(moran.p_sim),
                 "z_sim": float(moran.z_sim),
@@ -252,12 +262,12 @@ def run_global_moran(
     return pd.DataFrame(rows)
 
 
-def run_local_moran(bg_gdf: gpd.GeoDataFrame, *, value_column: str) -> gpd.GeoDataFrame:
+def run_local_moran(analysis_gdf: gpd.GeoDataFrame, *, value_column: str) -> gpd.GeoDataFrame:
     from esda.moran import Moran_Local
     from libpysal.weights import Queen
 
     frames: list[gpd.GeoDataFrame] = []
-    for municipio, subset in bg_gdf.groupby("municipio", sort=False):
+    for municipio, subset in analysis_gdf.groupby("municipio", sort=False):
         subset = subset[subset[value_column].notna()].copy()
         if len(subset) < 5:
             continue
@@ -275,8 +285,8 @@ def run_local_moran(bg_gdf: gpd.GeoDataFrame, *, value_column: str) -> gpd.GeoDa
         frames.append(subset)
 
     if not frames:
-        return gpd.GeoDataFrame(columns=["bg_geoid", "municipio", "lisa_cluster", "geometry"], geometry="geometry", crs=bg_gdf.crs)
-    return gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), geometry="geometry", crs=bg_gdf.crs)
+        return gpd.GeoDataFrame(columns=[GEOGRAPHY_ID_COLUMN, "municipio", "lisa_cluster", "geometry"], geometry="geometry", crs=analysis_gdf.crs)
+    return gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), geometry="geometry", crs=analysis_gdf.crs)
 
 
 def plot_lisa_map(lisa_gdf: gpd.GeoDataFrame, *, value_column: str, output_path: Path = LISA_MAP_OUTPUT_PATH) -> None:
@@ -327,32 +337,32 @@ def plot_lisa_map(lisa_gdf: gpd.GeoDataFrame, *, value_column: str, output_path:
 if __name__ == "__main__":
     db_path = resolve_db_path()
     con = connect(db_path)
-    bg_surface = load_bg_analysis_surface(con)
+    analysis_surface = load_analysis_surface(con)
     con.close()
 
-    outcome_column = resolve_primary_outcome(bg_surface)
-    covariates = resolve_analysis_covariates(bg_surface)
-    sensitivity_outcomes = [column_name for column_name in SENSITIVITY_OUTCOME_CANDIDATES if column_name in bg_surface.columns]
+    outcome_column = resolve_primary_outcome(analysis_surface)
+    covariates = resolve_analysis_covariates(analysis_surface)
+    sensitivity_outcomes = [column_name for column_name in SENSITIVITY_OUTCOME_CANDIDATES if column_name in analysis_surface.columns]
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     MAP_DIR.mkdir(parents=True, exist_ok=True)
 
-    correlations = build_correlation_table(bg_surface, outcome_column=outcome_column, covariates=covariates)
+    correlations = build_correlation_table(analysis_surface, outcome_column=outcome_column, covariates=covariates)
     correlations.to_csv(CORRELATION_OUTPUT_PATH, index=False)
 
-    moran_frames = [run_global_moran(bg_surface, value_column=outcome_column, weight_kind="queen")]
+    moran_frames = [run_global_moran(analysis_surface, value_column=outcome_column, weight_kind="queen")]
     weight_sensitivity = pd.concat(
         [
-            run_global_moran(bg_surface, value_column=outcome_column, weight_kind="queen"),
-            run_global_moran(bg_surface, value_column=outcome_column, weight_kind="rook"),
+            run_global_moran(analysis_surface, value_column=outcome_column, weight_kind="queen"),
+            run_global_moran(analysis_surface, value_column=outcome_column, weight_kind="rook"),
         ],
         ignore_index=True,
     )
     for value_column in sensitivity_outcomes:
-        moran_frames.append(run_global_moran(bg_surface, value_column=value_column, weight_kind="queen"))
+        moran_frames.append(run_global_moran(analysis_surface, value_column=value_column, weight_kind="queen"))
     morans_i = pd.concat([frame for frame in moran_frames if not frame.empty], ignore_index=True) if any(not frame.empty for frame in moran_frames) else pd.DataFrame()
 
-    lisa_gdf = run_local_moran(bg_surface, value_column=outcome_column)
+    lisa_gdf = run_local_moran(analysis_surface, value_column=outcome_column)
     if not morans_i.empty:
         morans_i.to_csv(MORAN_OUTPUT_PATH, index=False)
     weight_sensitivity.to_csv(WEIGHT_SENSITIVITY_OUTPUT_PATH, index=False)

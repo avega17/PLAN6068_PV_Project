@@ -2,7 +2,8 @@
 # # Occupied-H3 Tile Manifest for the Google Solar API Pipeline
 #
 # Builds `pr_solar_tile_manifest` — the prioritized list of Google Solar Data
-# Layers fetch targets for the two case-study municipalities.
+# Layers fetch targets for occupied H3 cells. By default this is island-wide;
+# downstream fetch notebooks can still scope to case-study municipalities.
 #
 # Important scope note:
 # - Despite the historical file name, this notebook no longer lays a new grid
@@ -14,8 +15,8 @@
 #   dataset.
 #
 # Workflow:
-# 1. Load occupied H3 cells from the Overture-building ingest for San Juan and
-#    Isabela.
+# 1. Load occupied H3 cells from the Overture-building ingest (all-island by
+#    default, optionally municipality-scoped).
 # 2. Carry forward municipality attribution, dominant-municipality counts, and
 #    the `crosses_municipality_boundary` diagnostic from the H3 source table.
 # 3. Count OSM rooftop PV labels per occupied H3 cell and boost priorities for
@@ -27,14 +28,13 @@
 # - `crosses_municipality_boundary=True` means an occupied H3 cell contains
 #   buildings attributed to more than one municipality in the island-wide
 #   Overture H3 summary.
-# - It is not a generic "near the edge of San Juan or Isabela" flag, so sparse
-#   `True` values are expected in the case-study subset.
+# - It is not a generic municipal-edge flag.
 
 # %%
 """04_bg_tile_manifest.py
 
-Jupytext-friendly builder for the Solar-API tile manifest covering San Juan
-and Isabela Block Groups.
+Jupytext-friendly builder for the Solar-API tile manifest from occupied H3
+cells (island-wide by default).
 """
 
 from __future__ import annotations
@@ -72,7 +72,30 @@ from utils.solar_tiling import (  # noqa: E402 - project imports after path setu
 from utils.overture import occupied_h3_cells_sql
 
 OUTPUT_CRS = "EPSG:4326"
-TARGET_MUNICIPALITIES = ["San Juan", "Isabela"]
+
+
+def _parse_csv_env(env_name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    value = os.getenv(env_name)
+    if not value:
+        return default
+    cleaned = value.strip()
+    if len(cleaned) >= 2 and cleaned[0] in "([{" and cleaned[-1] in ")]}":
+        cleaned = cleaned[1:-1]
+    parts: list[str] = []
+    for raw_part in cleaned.split(","):
+        part = raw_part.strip().strip("\"'").strip()
+        part = part.strip("()[]{}")
+        if part:
+            parts.append(part)
+    return tuple(parts) or default
+
+
+_TARGET_MUNICIPALITIES_RAW = (os.getenv("GEOAI_TARGET_MUNICIPALITIES", "") or "").strip()
+if _TARGET_MUNICIPALITIES_RAW.lower() in {"", "all", "*"}:
+    TARGET_MUNICIPALITIES: tuple[str, ...] = tuple()
+else:
+    TARGET_MUNICIPALITIES = _parse_csv_env("GEOAI_TARGET_MUNICIPALITIES", tuple())
+
 MANIFEST_TABLE = "pr_solar_tile_manifest"
 OVERTURE_BUILDINGS_TABLE = "pr_overture_buildings"
 # Seed neighborhoods to score as priority-3. Pulled from OSM via osmnx on demand.
@@ -117,10 +140,18 @@ def _to_bytes(value: object) -> bytes:
 
 
 # %%
-def fetch_occupied_h3_cells(con: duckdb.DuckDBPyConnection, municipalities: list[str]) -> gpd.GeoDataFrame:
-    """Derive occupied H3 cells for ``municipalities`` from the base Overture table."""
+def fetch_occupied_h3_cells(con: duckdb.DuckDBPyConnection, municipalities: tuple[str, ...]) -> gpd.GeoDataFrame:
+    """Derive occupied H3 cells from the base Overture table.
 
-    names_sql = ", ".join("?" * len(municipalities))
+    When ``municipalities`` is empty, returns an island-wide manifest.
+    """
+
+    municipio_filter_sql = ""
+    params: list[object] = []
+    if municipalities:
+        names_sql = ", ".join("?" * len(municipalities))
+        municipio_filter_sql = f"\n        WHERE municipality_name IN ({names_sql})"
+        params.extend(municipalities)
     table_count = con.execute(
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?;",
         [OVERTURE_BUILDINGS_TABLE],
@@ -146,10 +177,10 @@ def fetch_occupied_h3_cells(con: duckdb.DuckDBPyConnection, municipalities: list
             cell_center_lat,
             ST_AsWKB(geometry) AS geometry_wkb
         FROM occupied_h3
-        WHERE municipality_name IN ({names_sql})
+        {municipio_filter_sql}
         ORDER BY municipio, building_count DESC, h3_cell_id;
         """,
-        list(municipalities),
+        params,
     ).fetchdf()
 
     geometry = gpd.GeoSeries(df["geometry_wkb"].map(lambda v: from_wkb(_to_bytes(v))), crs=OUTPUT_CRS)
@@ -237,6 +268,10 @@ if __name__ == "__main__":
 
     h3_cells = fetch_occupied_h3_cells(con, TARGET_MUNICIPALITIES)
     osm_pv = fetch_osm_pv(con)
+    if TARGET_MUNICIPALITIES:
+        print(f"manifest scope: municipality subset -> {', '.join(TARGET_MUNICIPALITIES)}")
+    else:
+        print("manifest scope: all occupied H3 cells island-wide")
     print(f"occupied H3 cells: {len(h3_cells):,} | osm PV: {len(osm_pv):,}")
 
     seeds = fetch_seed_neighborhoods()

@@ -45,6 +45,12 @@ from utils.geoai_segmentation import (
     evaluate_holdout_building_metrics,
     summarize_holdout_building_metrics,
 )
+from utils.geoai_training_contract import (
+    build_training_contract,
+    compare_training_contracts,
+    project_relative_path,
+    training_contract_run_fragment,
+)
 
 
 def _resolve_configured_path(env_name: str, default: Path) -> Path:
@@ -85,29 +91,33 @@ DINOV3_BACKBONE_PRESETS = {
         "label": "ViT-L/16 SAT-493M (GeoAI-ready)",
         "model_name": "dinov3_vitl16",
         "normalization_profile": "sat493m",
+        "hub_weights": "SAT493M",
         "requires_explicit_weights": False,
-        "note": "Correct GeoAI hub model is dinov3_vitl16; the satellite specialization comes from SAT-493M weights and normalization.",
+        "note": "Correct GeoAI hub model is dinov3_vitl16; this preset keeps GeoAI's working SAT-493M .pth fallback plus the SAT normalization profile.",
     },
     "vit7b16_sat493m": {
-        "label": "ViT-7B/16 SAT-493M (compatible .pth required)",
+        "label": "ViT-7B/16 SAT-493M (official hub / optional .pth)",
         "model_name": "dinov3_vit7b16",
         "normalization_profile": "sat493m",
-        "requires_explicit_weights": True,
-        "note": "The Facebook Hugging Face repo exposes Transformers safetensors, not a GeoAI-compatible torch.hub .pth backbone file.",
+        "hub_weights": "SAT493M",
+        "requires_explicit_weights": False,
+        "note": "When no local .pth is supplied, the notebook now requests the official DINOv3 SAT-493M checkpoint URL for dinov3_vit7b16 instead of GeoAI's incorrect ViT-L fallback.",
     },
     "vitl16_lvd1689m": {
-        "label": "ViT-L/16 LVD-1689M (compatible .pth required)",
+        "label": "ViT-L/16 LVD-1689M (official hub / optional .pth)",
         "model_name": "dinov3_vitl16",
         "normalization_profile": "lvd1689m",
-        "requires_explicit_weights": True,
-        "note": "GeoAI's finetune helper only auto-resolves the SAT-493M ViT-L weights, so web-pretrained runs need an explicit local .pth.",
+        "hub_weights": "LVD1689M",
+        "requires_explicit_weights": False,
+        "note": "When no local .pth is supplied, the notebook now requests the official DINOv3 LVD-1689M checkpoint URL instead of GeoAI's incorrect SAT fallback.",
     },
     "vitb16_lvd1689m": {
-        "label": "ViT-B/16 LVD-1689M (compatible .pth required)",
+        "label": "ViT-B/16 LVD-1689M (official hub / optional .pth)",
         "model_name": "dinov3_vitb16",
         "normalization_profile": "lvd1689m",
-        "requires_explicit_weights": True,
-        "note": "GeoAI's finetune helper only auto-resolves the SAT-493M ViT-L weights, so web-pretrained runs need an explicit local .pth.",
+        "hub_weights": "LVD1689M",
+        "requires_explicit_weights": False,
+        "note": "When no local .pth is supplied, the notebook now requests the official DINOv3 LVD-1689M checkpoint URL instead of GeoAI's incorrect SAT fallback.",
     },
 }
 DINOV3_ALLOWED_HUB_MODELS = {
@@ -126,6 +136,7 @@ DINOV3_ALLOWED_HUB_MODELS = {
 BACKBONE_PRESET = (os.getenv("GEOAI_DINOV3_BACKBONE_PRESET", "vitl16_sat493m") or "vitl16_sat493m").strip().lower()
 BACKBONE_WEIGHTS_PATH = _resolve_optional_path(os.getenv("GEOAI_DINOV3_WEIGHTS_PATH"))
 MODEL_NAME = "dinov3_vitl16"
+BACKBONE_HUB_WEIGHTS = "SAT493M"
 INPUT_NORMALIZATION_PROFILE = "sat493m"
 INPUT_NORMALIZATION_MEAN = DINOV3_NORMALIZATION_PROFILES[INPUT_NORMALIZATION_PROFILE]["mean"]
 INPUT_NORMALIZATION_STD = DINOV3_NORMALIZATION_PROFILES[INPUT_NORMALIZATION_PROFILE]["std"]
@@ -137,6 +148,14 @@ BATCH_SIZE = int(os.getenv("GEOAI_DINOV3_BATCH_SIZE", "16"))
 LEARNING_RATE = float(os.getenv("GEOAI_DINOV3_LEARNING_RATE", "1e-4"))
 WEIGHT_DECAY = float(os.getenv("GEOAI_DINOV3_WEIGHT_DECAY", "1e-4"))
 NUM_WORKERS = int(os.getenv("GEOAI_DINOV3_NUM_WORKERS", str(default_num_workers())))
+LIGHTNING_PRECISION = (
+    os.getenv("GEOAI_DINOV3_LIGHTNING_PRECISION", "bf16-mixed" if torch.cuda.is_available() else "32-true")
+    or "32-true"
+).strip()
+FLOAT32_MATMUL_PRECISION = (os.getenv("GEOAI_DINOV3_FLOAT32_MATMUL_PRECISION", "high") or "high").strip().lower()
+ENABLE_TF32 = os.getenv("GEOAI_DINOV3_ENABLE_TF32", "1") == "1"
+ENABLE_CUDNN_BENCHMARK = os.getenv("GEOAI_DINOV3_CUDNN_BENCHMARK", "1") == "1"
+CUDA_EMPTY_CACHE_BEFORE_TRAINING = os.getenv("GEOAI_DINOV3_EMPTY_CACHE_BEFORE_TRAINING", "1") == "1"
 FREEZE_BACKBONE = os.getenv("GEOAI_DINOV3_FREEZE_BACKBONE", "1") == "1"
 USE_LORA = os.getenv("GEOAI_DINOV3_USE_LORA", "0") == "1"
 LORA_RANK = int(os.getenv("GEOAI_DINOV3_LORA_RANK", "4"))
@@ -165,28 +184,51 @@ EVAL_SUMMARY_JSON = EVAL_ROOT / "split_summary.json"
 
 ACCELERATOR = (os.getenv("GEOAI_DINOV3_ACCELERATOR", "auto") or "auto").strip()
 DEVICES = (os.getenv("GEOAI_DINOV3_DEVICES", "auto") or "auto").strip()
-EARLY_STOPPING_PATIENCE = int(os.getenv("GEOAI_DINOV3_PATIENCE", "10") or "10")
+EARLY_STOPPING_PATIENCE = int(os.getenv("GEOAI_DINOV3_PATIENCE", "15") or "15")
 SEED = int(os.getenv("GEOAI_DINOV3_SEED", "323") or "323")
 RUN_DINOV3_TRAINING = os.getenv("GEOAI_RUN_DINOV3_TRAINING", "1") == "1"
 RUN_DINOV3_PREVIEW = os.getenv("GEOAI_RUN_DINOV3_PREVIEW", "1") == "1"
 RUN_DINOV3_EVAL = os.getenv("GEOAI_RUN_DINOV3_EVAL", "0") == "1"
+RUN_DINOV3_TRANSFORM_PREVIEW = os.getenv("GEOAI_RUN_DINOV3_TRANSFORM_PREVIEW", "1") == "1"
+DINOV3_TRANSFORM_PREVIEW_COUNT = int(os.getenv("GEOAI_DINOV3_TRANSFORM_PREVIEW_COUNT", "6") or "6")
 PREVIEW_SPLIT = (os.getenv("GEOAI_DINOV3_PREVIEW_SPLIT", "val") or "val").strip().lower()
+DINOV3_SIMILARITY_SPLIT_OVERRIDE = os.getenv("GEOAI_DINOV3_SIMILARITY_SPLIT")
+DINOV3_SIMILARITY_SPLIT = (DINOV3_SIMILARITY_SPLIT_OVERRIDE or PREVIEW_SPLIT).strip().lower()
+RUN_DINOV3_SIMILARITY_PREVIEW = os.getenv("GEOAI_RUN_DINOV3_SIMILARITY_PREVIEW", "0") == "1"
+DINOV3_SIMILARITY_PREVIEW_COUNT = int(os.getenv("GEOAI_DINOV3_SIMILARITY_PREVIEW_COUNT", "3") or "3")
+DINOV3_SIMILARITY_TARGET_SIZE = int(os.getenv("GEOAI_DINOV3_SIMILARITY_TARGET_SIZE", "1024") or "1024")
+DINOV3_SIMILARITY_COLORMAP = (os.getenv("GEOAI_DINOV3_SIMILARITY_COLORMAP", "turbo") or "turbo").strip()
+DINOV3_SIMILARITY_ALPHA = float(os.getenv("GEOAI_DINOV3_SIMILARITY_ALPHA", "0.75") or "0.75")
 PREVIEW_COUNT = int(os.getenv("GEOAI_DINOV3_PREVIEW_COUNT", "5") or "5")
 EXTERNAL_PREVIEW_COUNT = int(os.getenv("GEOAI_DINOV3_EXTERNAL_PREVIEW_COUNT", "1") or "1")
 PREVIEW_WINDOW_SIZE = int(os.getenv("GEOAI_DINOV3_PREVIEW_WINDOW_SIZE", "512") or "512")
 PREVIEW_OVERLAP = int(os.getenv("GEOAI_DINOV3_PREVIEW_OVERLAP", "256") or "256")
 PREVIEW_BATCH_SIZE = int(os.getenv("GEOAI_DINOV3_PREVIEW_BATCH_SIZE", "8") or "8")
+EVAL_BATCH_SIZE = int(
+    os.getenv("GEOAI_DINOV3_EVAL_BATCH_SIZE", str(max(PREVIEW_BATCH_SIZE, BATCH_SIZE)))
+    or str(max(PREVIEW_BATCH_SIZE, BATCH_SIZE))
+)
 EVAL_SPLITS = tuple(
     split_name.strip().lower()
     for split_name in (os.getenv("GEOAI_DINOV3_EVAL_SPLITS", "val,test") or "val,test").split(",")
     if split_name.strip()
 )
 EVAL_MAX_ROWS = int(os.getenv("GEOAI_DINOV3_EVAL_MAX_ROWS", "0") or "0")
-EVAL_REVIEW_COUNT = int(os.getenv("GEOAI_DINOV3_EVAL_REVIEW_COUNT", "6") or "6")
+EVAL_REVIEW_COUNT = int(os.getenv("GEOAI_DINOV3_EVAL_REVIEW_COUNT", "12") or "12")
+RUN_DINOV3_TEST_DETECTION_PREVIEW = os.getenv("GEOAI_DINOV3_RUN_TEST_DETECTION_PREVIEW", "1") == "1"
+TEST_DETECTION_SAMPLE_COUNT = int(os.getenv("GEOAI_DINOV3_TEST_DETECTION_SAMPLE_COUNT", "24") or "24")
 STAC_TILE_ROOT = PROJECT_ROOT / "outputs" / "stac_tiles"
 LOCAL_STAC_CACHE_ROOT = PROJECT_ROOT / "data" / "rasters" / "stac" / "local"
 SOLAR_RASTER_ROOT = PROJECT_ROOT / "data" / "rasters" / "solar"
 SUPPORTED_IMAGE_EXTENSIONS = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
+RUN_NAMING_VERSION = 2
+RESUME_TRAINING = os.getenv("GEOAI_DINOV3_RESUME_TRAINING", "1") == "1"
+RESUME_RUN_DIR = _resolve_optional_path(os.getenv("GEOAI_DINOV3_RESUME_RUN_DIR"))
+RESUME_CHECKPOINT = _resolve_optional_path(os.getenv("GEOAI_DINOV3_RESUME_CHECKPOINT"))
+TRAINING_CONTRACT: dict[str, object] | None = None
+DINOV3_OFFICIAL_BASE_URL = "https://dl.fbaipublicfiles.com/dinov3"
+_ORIGINAL_DINOV3_PROCESSOR_LOAD_MODEL = None
+_ORIGINAL_DINOV3_SEGMENTER_LOAD_BACKBONE = None
 
 
 def _slugify(value: object) -> str:
@@ -225,9 +267,10 @@ def get_backbone_preset(preset_key: str | None = None) -> dict[str, object]:
 
 
 def apply_backbone_settings() -> None:
-    global MODEL_NAME, INPUT_NORMALIZATION_PROFILE, INPUT_NORMALIZATION_MEAN, INPUT_NORMALIZATION_STD, BACKBONE_NOTE
+    global MODEL_NAME, BACKBONE_HUB_WEIGHTS, INPUT_NORMALIZATION_PROFILE, INPUT_NORMALIZATION_MEAN, INPUT_NORMALIZATION_STD, BACKBONE_NOTE
     preset = get_backbone_preset()
     MODEL_NAME = str(preset["model_name"])
+    BACKBONE_HUB_WEIGHTS = str(preset.get("hub_weights") or "").strip().upper()
     INPUT_NORMALIZATION_PROFILE = str(preset["normalization_profile"])
     profile = DINOV3_NORMALIZATION_PROFILES[INPUT_NORMALIZATION_PROFILE]
     INPUT_NORMALIZATION_MEAN = tuple(float(value) for value in profile["mean"])
@@ -246,11 +289,182 @@ def resolve_backbone_weights_path() -> Path | None:
             )
         return BACKBONE_WEIGHTS_PATH
 
-    if bool(preset["requires_explicit_weights"]):
+    if bool(preset["requires_explicit_weights"]) and not str(preset.get("hub_weights") or "").strip():
         raise RuntimeError(
             f"Backbone preset {BACKBONE_PRESET!r} requires GEOAI_DINOV3_WEIGHTS_PATH to point to a compatible local .pth file."
         )
     return None
+
+
+def resolve_backbone_hub_weights_name(metadata: dict[str, object] | None = None) -> str:
+    if metadata is not None:
+        raw_hub_weights = metadata.get("hub_weights")
+        if isinstance(raw_hub_weights, str) and raw_hub_weights.strip():
+            return raw_hub_weights.strip().upper()
+        raw_preset = metadata.get("backbone_preset")
+        if isinstance(raw_preset, str) and raw_preset.strip():
+            preset = get_backbone_preset(raw_preset)
+            hub_weights = str(preset.get("hub_weights") or "").strip().upper()
+            if hub_weights:
+                return hub_weights
+
+    preset = get_backbone_preset()
+    hub_weights = str(preset.get("hub_weights") or "").strip().upper()
+    if not hub_weights:
+        raise RuntimeError(f"Backbone preset {BACKBONE_PRESET!r} does not define a DINOv3 weight family.")
+    return hub_weights
+
+
+def build_official_dinov3_weights_url(model_name: str, hub_weights_name: str) -> str:
+    if model_name not in DINOV3_ALLOWED_HUB_MODELS:
+        raise RuntimeError(
+            f"Unsupported DINOv3 hub model {model_name!r}; expected one of {sorted(DINOV3_ALLOWED_HUB_MODELS)}"
+        )
+    if hub_weights_name not in {"SAT493M", "LVD1689M"}:
+        raise RuntimeError(
+            f"Unsupported DINOv3 weight family {hub_weights_name!r}; expected SAT493M or LVD1689M."
+        )
+    weights_slug = hub_weights_name.lower()
+    return f"{DINOV3_OFFICIAL_BASE_URL}/{model_name}/{model_name}_pretrain_{weights_slug}.pth"
+
+
+def resolve_dinov3_hub_location() -> tuple[str, str]:
+    dinov3_location = os.getenv("DINOV3_LOCATION", "facebookresearch/dinov3")
+    dinov3_source = "local" if dinov3_location != "facebookresearch/dinov3" else "github"
+    if dinov3_location != "facebookresearch/dinov3" and dinov3_location not in sys.path:
+        sys.path.append(dinov3_location)
+    return dinov3_location, dinov3_source
+
+
+def _should_use_geoai_sat_fallback(model_name: str, hub_weights_name: str) -> bool:
+    return model_name == "dinov3_vitl16" and hub_weights_name == "SAT493M"
+
+
+def _load_backbone_from_official_dinov3_hub(
+    *,
+    model_name: str,
+    hub_weights_name: str,
+    device: torch.device | None = None,
+) -> torch.nn.Module:
+    dinov3_location, dinov3_source = resolve_dinov3_hub_location()
+    weights_url = build_official_dinov3_weights_url(model_name, hub_weights_name)
+    try:
+        model = torch.hub.load(
+            repo_or_dir=dinov3_location,
+            model=model_name,
+            source=dinov3_source,
+            pretrained=True,
+            weights=weights_url,
+            trust_repo=True,
+            skip_validation=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to auto-resolve {model_name} with official DINOv3 {hub_weights_name} weights ({weights_url}). "
+            "Set GEOAI_DINOV3_WEIGHTS_PATH to a compatible local .pth if this environment cannot reach the upstream checkpoint."
+        ) from exc
+
+    if device is not None:
+        model = model.to(device)
+    model.eval()
+    return model
+
+
+def configure_geoai_dinov3_weight_loaders(metadata: dict[str, object] | None = None) -> None:
+    import importlib
+    import geoai.dinov3 as dinov3_module
+    import geoai.dinov3_finetune as finetune_module
+
+    global _ORIGINAL_DINOV3_PROCESSOR_LOAD_MODEL, _ORIGINAL_DINOV3_SEGMENTER_LOAD_BACKBONE
+
+    def _is_plan6068_patch(func: object) -> bool:
+        return bool(getattr(func, "_plan6068_patched", False))
+
+    def _resolve_original_loader(
+        owner: object,
+        *,
+        attr_name: str,
+        storage_attr: str,
+        cached: object | None,
+    ) -> object | None:
+        stored = getattr(owner, storage_attr, None)
+        if callable(stored):
+            return stored
+
+        current = getattr(owner, attr_name)
+        if callable(cached) and not _is_plan6068_patch(cached):
+            original = cached
+        elif callable(current) and not _is_plan6068_patch(current):
+            original = current
+        else:
+            return None
+
+        setattr(owner, storage_attr, original)
+        return original
+
+    hub_weights_name = resolve_backbone_hub_weights_name(metadata)
+    processor_original = _resolve_original_loader(
+        dinov3_module.DINOv3GeoProcessor,
+        attr_name="_load_model",
+        storage_attr="_plan6068_original_load_model",
+        cached=_ORIGINAL_DINOV3_PROCESSOR_LOAD_MODEL,
+    )
+    segmenter_original = _resolve_original_loader(
+        finetune_module.DINOv3Segmenter,
+        attr_name="_load_backbone",
+        storage_attr="_plan6068_original_load_backbone",
+        cached=_ORIGINAL_DINOV3_SEGMENTER_LOAD_BACKBONE,
+    )
+
+    if processor_original is None or segmenter_original is None:
+        dinov3_module = importlib.reload(dinov3_module)
+        finetune_module = importlib.reload(finetune_module)
+        processor_original = dinov3_module.DINOv3GeoProcessor._load_model
+        segmenter_original = finetune_module.DINOv3Segmenter._load_backbone
+        dinov3_module.DINOv3GeoProcessor._plan6068_original_load_model = processor_original
+        finetune_module.DINOv3Segmenter._plan6068_original_load_backbone = segmenter_original
+
+    _ORIGINAL_DINOV3_PROCESSOR_LOAD_MODEL = processor_original
+    _ORIGINAL_DINOV3_SEGMENTER_LOAD_BACKBONE = segmenter_original
+
+    def _patched_load_model(self, weights_path: str | None = None) -> torch.nn.Module:
+        if weights_path:
+            candidate = Path(weights_path)
+            if not candidate.exists():
+                raise RuntimeError(f"Configured DINOv3 weights_path not found: {candidate}")
+            return _ORIGINAL_DINOV3_PROCESSOR_LOAD_MODEL(self, str(candidate))
+
+        if _should_use_geoai_sat_fallback(self.model_name, hub_weights_name):
+            return _ORIGINAL_DINOV3_PROCESSOR_LOAD_MODEL(self, None)
+
+        return _load_backbone_from_official_dinov3_hub(
+            model_name=self.model_name,
+            hub_weights_name=hub_weights_name,
+            device=self.device,
+        )
+
+    def _patched_load_backbone(model_name: str, weights_path: str | None) -> torch.nn.Module:
+        if weights_path:
+            candidate = Path(weights_path)
+            if not candidate.exists():
+                raise RuntimeError(f"Configured DINOv3 weights_path not found: {candidate}")
+            return _ORIGINAL_DINOV3_SEGMENTER_LOAD_BACKBONE(model_name, str(candidate))
+
+        if _should_use_geoai_sat_fallback(model_name, hub_weights_name):
+            return _ORIGINAL_DINOV3_SEGMENTER_LOAD_BACKBONE(model_name, None)
+
+        return _load_backbone_from_official_dinov3_hub(
+            model_name=model_name,
+            hub_weights_name=hub_weights_name,
+        )
+
+    _patched_load_model._plan6068_patched = True
+    _patched_load_backbone._plan6068_patched = True
+
+    dinov3_module.DINOv3GeoProcessor._load_model = _patched_load_model
+    dinov3_module.DINOv3GeoProcessor._plan6068_hub_weights = hub_weights_name
+    finetune_module.DINOv3Segmenter._load_backbone = staticmethod(_patched_load_backbone)
+    finetune_module.DINOv3Segmenter._plan6068_hub_weights = hub_weights_name
 
 
 def _display_path(path: Path | None) -> str | None:
@@ -286,8 +500,42 @@ def resolve_runtime_device() -> torch.device:
     return torch.device("cpu")
 
 
+def configure_torch_gpu_performance() -> None:
+    valid_matmul_precision = {"highest", "high", "medium"}
+    if FLOAT32_MATMUL_PRECISION not in valid_matmul_precision:
+        raise RuntimeError(
+            "GEOAI_DINOV3_FLOAT32_MATMUL_PRECISION must be one of "
+            f"{sorted(valid_matmul_precision)}; got {FLOAT32_MATMUL_PRECISION!r}."
+        )
+    torch.set_float32_matmul_precision(FLOAT32_MATMUL_PRECISION)
+
+    if not torch.cuda.is_available():
+        print(
+            "GPU tuning: CUDA unavailable; using CPU-safe settings "
+            f"precision={LIGHTNING_PRECISION} | matmul_precision={FLOAT32_MATMUL_PRECISION}"
+        )
+        return
+
+    torch.backends.cuda.matmul.allow_tf32 = ENABLE_TF32
+    torch.backends.cudnn.allow_tf32 = ENABLE_TF32
+    torch.backends.cudnn.benchmark = ENABLE_CUDNN_BENCHMARK
+    if CUDA_EMPTY_CACHE_BEFORE_TRAINING:
+        torch.cuda.empty_cache()
+
+    gpu_name = torch.cuda.get_device_name(0)
+    total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    print(
+        "GPU tuning: "
+        f"{gpu_name} ({total_vram_gb:.1f} GB) | precision={LIGHTNING_PRECISION} | "
+        f"matmul_precision={FLOAT32_MATMUL_PRECISION} | tf32={ENABLE_TF32} | "
+        f"cudnn_benchmark={ENABLE_CUDNN_BENCHMARK}"
+    )
+
+
 def load_dinov3_segmenter(checkpoint_path: Path, metadata: dict[str, object], device: torch.device):
     from geoai.dinov3_finetune import DINOv3Segmenter
+
+    configure_geoai_dinov3_weight_loaders(metadata=metadata)
 
     weights_path_value = metadata.get("weights_path")
     weights_path = None
@@ -319,6 +567,15 @@ def load_dinov3_segmenter(checkpoint_path: Path, metadata: dict[str, object], de
     return model_module
 
 
+def build_dinov3_inference_runtime(checkpoint_path: Path, metadata: dict[str, object]) -> dict[str, object]:
+    device = resolve_runtime_device()
+    model_module = load_dinov3_segmenter(checkpoint_path, metadata, device)
+    return {
+        "device": device,
+        "model_module": model_module,
+    }
+
+
 def dinov3_segment_geotiff_with_runtime_settings(
     *,
     input_path: Path,
@@ -328,6 +585,8 @@ def dinov3_segment_geotiff_with_runtime_settings(
     window_size: int,
     overlap: int,
     batch_size: int,
+    runtime: dict[str, object] | None = None,
+    progress_desc: str = "DINOv3 windows",
 ) -> None:
     from rasterio.windows import Window
     from tqdm import tqdm
@@ -335,8 +594,12 @@ def dinov3_segment_geotiff_with_runtime_settings(
     if overlap >= window_size:
         raise ValueError(f"overlap ({overlap}) must be less than window_size ({window_size})")
 
-    device = resolve_runtime_device()
-    model_module = load_dinov3_segmenter(checkpoint_path, metadata, device)
+    if runtime is None:
+        device = resolve_runtime_device()
+        model_module = load_dinov3_segmenter(checkpoint_path, metadata, device)
+    else:
+        device = runtime["device"]
+        model_module = runtime["model_module"]
     patch_size = int(model_module.patch_size)
 
     with rasterio.open(input_path) as src:
@@ -384,7 +647,7 @@ def dinov3_segment_geotiff_with_runtime_settings(
         with torch.no_grad():
             batch_imgs: list[np.ndarray] = []
             batch_meta: list[tuple[int, int, int, int, int, int]] = []
-            progress = tqdm(total=n_rows * n_cols, disable=False, desc="DINOv3 windows")
+            progress = tqdm(total=n_rows * n_cols, disable=False, desc=progress_desc)
 
             for row_index in range(n_rows):
                 for col_index in range(n_cols):
@@ -424,13 +687,17 @@ def dinov3_segment_geotiff_with_runtime_settings(
 
 def refresh_runtime_paths() -> None:
     global MODEL_OUT, PREVIEW_ROOT, EVAL_ROOT, METADATA_PATH, EVAL_METRICS_CSV, EVAL_BUILDING_METRICS_CSV, EVAL_SUMMARY_JSON
+    resume_model_dir = resolve_resume_model_dir() if RESUME_TRAINING else None
     if EXPLICIT_MODEL_OUT is not None:
         model_out = EXPLICIT_MODEL_OUT
+    elif resume_model_dir is not None:
+        model_out = resume_model_dir
     else:
         mode_slug = f"lora-r{LORA_RANK}" if USE_LORA else "frozen"
+        data_slug = training_contract_run_fragment(TRAINING_CONTRACT)
         model_out = BASE_MODEL_ROOT / (
             f"{_slugify(BACKBONE_PRESET)}__hub-{_slugify(MODEL_NAME)}__df{DECODER_FEATURES}__ps{PATCH_SIZE}"
-            f"__e{NUM_EPOCHS}__b{BATCH_SIZE}__lr{_float_slug(LEARNING_RATE)}__{mode_slug}"
+            f"__e{NUM_EPOCHS}__b{BATCH_SIZE}__lr{_float_slug(LEARNING_RATE)}__{mode_slug}__{data_slug}"
         )
     MODEL_OUT = model_out
     PREVIEW_ROOT = EXPLICIT_PREVIEW_ROOT or MODEL_OUT / "preview"
@@ -440,13 +707,159 @@ def refresh_runtime_paths() -> None:
     EVAL_BUILDING_METRICS_CSV = EVAL_ROOT / "holdout_building_metrics.csv"
     EVAL_SUMMARY_JSON = EVAL_ROOT / "split_summary.json"
 
+
+def resolve_resume_model_dir() -> Path | None:
+    if RESUME_RUN_DIR is not None:
+        return RESUME_RUN_DIR
+    if RESUME_CHECKPOINT is not None:
+        return RESUME_CHECKPOINT.parent if RESUME_CHECKPOINT.is_file() else RESUME_CHECKPOINT
+    return None
+
+
+def resolve_resume_checkpoint() -> Path | None:
+    if not RESUME_TRAINING:
+        return None
+    if RESUME_CHECKPOINT is not None:
+        return RESUME_CHECKPOINT
+
+    model_dir = resolve_resume_model_dir() or MODEL_OUT
+    candidates = [
+        model_dir / "models" / "last.ckpt",
+        model_dir / "last.ckpt",
+        model_dir / "models" / "final.ckpt",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    ckpt_candidates = sorted(model_dir.rglob("*.ckpt"), key=lambda path: (-path.stat().st_mtime, path.name))
+    if ckpt_candidates:
+        return ckpt_candidates[0]
+
+    weight_candidates = sorted(
+        [path for path in model_dir.rglob("*") if path.is_file() and path.suffix.lower() in {".pth", ".pt"}],
+        key=lambda path: (-path.stat().st_mtime, path.name),
+    )
+    return weight_candidates[0] if weight_candidates else None
+
+
+def apply_manifest_training_contract(manifest: pd.DataFrame) -> None:
+    global TRAINING_CONTRACT
+    TRAINING_CONTRACT = build_training_contract(
+        manifest,
+        train_root=TRAIN_ROOT,
+        manifest_path=TRAIN_MANIFEST,
+        project_root=PROJECT_ROOT,
+    )
+    refresh_runtime_paths()
+
+
+def normalize_model_identity_value(value: object) -> object:
+    if isinstance(value, tuple):
+        return list(value)
+    return value
+
+
+def current_model_identity() -> dict[str, object]:
+    return {
+        "backbone_preset": BACKBONE_PRESET,
+        "model_name": MODEL_NAME,
+        "hub_weights": BACKBONE_HUB_WEIGHTS,
+        "weights_path": _display_path(resolve_backbone_weights_path()),
+        "input_normalization_profile": INPUT_NORMALIZATION_PROFILE,
+        "num_classes": NUM_CLASSES,
+        "decoder_features": DECODER_FEATURES,
+        "patch_size": PATCH_SIZE,
+        "target_size": TARGET_SIZE,
+        "freeze_backbone": FREEZE_BACKBONE,
+        "use_lora": USE_LORA,
+        "lora_rank": LORA_RANK,
+    }
+
+
+def load_saved_dinov3_metadata(model_dir: Path) -> dict[str, object]:
+    metadata_path = model_dir / "dinov3_metadata.json"
+    if not metadata_path.exists():
+        return {}
+    return json.loads(metadata_path.read_text())
+
+
+def _format_resume_mismatches(mismatches: dict[str, dict[str, object]]) -> str:
+    return "; ".join(
+        f"{key}: current={values['current']!r} saved={values['saved']!r}"
+        for key, values in sorted(mismatches.items())
+    )
+
+
+def ensure_resume_compatible() -> Path | None:
+    if not RESUME_TRAINING:
+        return None
+
+    resume_checkpoint = resolve_resume_checkpoint()
+    if resume_checkpoint is None or not resume_checkpoint.exists():
+        raise FileNotFoundError(
+            "resume training requested, but no DINOv3 checkpoint was found. "
+            "Set GEOAI_DINOV3_RESUME_CHECKPOINT or GEOAI_DINOV3_RESUME_RUN_DIR."
+        )
+
+    resume_model_dir = resolve_resume_model_dir() or resume_checkpoint.parent.parent if resume_checkpoint.parent.name == "models" else resume_checkpoint.parent
+    metadata = load_saved_dinov3_metadata(resume_model_dir)
+    if metadata:
+        saved_model_identity = {
+            key: normalize_model_identity_value(metadata.get(key))
+            for key in (
+                "backbone_preset",
+                "model_name",
+                "hub_weights",
+                "weights_path",
+                "input_normalization_profile",
+                "num_classes",
+                "decoder_features",
+                "patch_size",
+                "target_size",
+                "freeze_backbone",
+                "use_lora",
+                "lora_rank",
+            )
+            if key in metadata
+        }
+        model_mismatches = {
+            key: {
+                "current": normalize_model_identity_value(current_model_identity()[key]),
+                "saved": saved_model_identity[key],
+            }
+            for key in saved_model_identity
+            if normalize_model_identity_value(current_model_identity()[key]) != saved_model_identity[key]
+        }
+        if model_mismatches:
+            raise RuntimeError(
+                "DINOv3 resume configuration does not match the saved model identity: "
+                + _format_resume_mismatches(model_mismatches)
+            )
+
+        saved_contract = metadata.get("training_contract")
+        if isinstance(saved_contract, dict):
+            contract_mismatches = compare_training_contracts(TRAINING_CONTRACT, saved_contract)
+            if contract_mismatches:
+                raise RuntimeError(
+                    "DINOv3 resume configuration does not match the saved training contract: "
+                    + _format_resume_mismatches(contract_mismatches)
+                )
+        else:
+            metadata["training_contract"] = TRAINING_CONTRACT
+            metadata["legacy_training_contract_inferred"] = True
+            (resume_model_dir / "dinov3_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+
+    return resume_checkpoint
+
 # %% [markdown]
 # ## Notebook Controls
 # 
 # These controls expose the most impactful DINOv3 sweep parameters without
-# changing the safe script defaults. The SAT-493M preset still uses the hub
-# model name `dinov3_vitl16`; the satellite specialization comes from the
-# backbone weights and input normalization, not from a separate GeoAI model id.
+# changing the safe script defaults. GeoAI's built-in DINOv3 helpers still
+# hardcode a ViT-L SAT fallback when `weights_path` is omitted, so this notebook
+# patches the non-default presets to request the matching official DINOv3 weight
+# family instead.
 
 # %%
 DINOV3_MODEL_CHOICES = [
@@ -543,6 +956,11 @@ def _maybe_initialize_dinov3_widgets() -> dict[str, object] | None:
         description="Run eval",
         indent=False,
     )
+    run_similarity_widget = widgets.Checkbox(
+        value=RUN_DINOV3_SIMILARITY_PREVIEW,
+        description="Run similarity preview",
+        indent=False,
+    )
     preview_split_widget = widgets.Dropdown(
         options=["train", "val", "test"],
         value=PREVIEW_SPLIT,
@@ -558,8 +976,8 @@ def _maybe_initialize_dinov3_widgets() -> dict[str, object] | None:
 
     display(
         Markdown(
-            "**Backbone note**: `facebook/dinov3-vitl16-pretrain-sat493m` is a Hugging Face repository id, not a GeoAI `model_name`. "
-            "For the SAT-493M backbone in this notebook, use the preset that resolves to hub model `dinov3_vitl16` and SAT-specific normalization."
+            "**Backbone note**: GeoAI's current DINOv3 loaders always fall back to the ViT-L SAT-493M checkpoint when `weights_path` is omitted. "
+            "This notebook keeps that working path for `vitl16_sat493m`, but for `vit7b16_sat493m` and the LVD presets it now requests the matching official DINOv3 checkpoint URL before asking for a local `.pth`."
         )
     )
     display(
@@ -576,7 +994,7 @@ def _maybe_initialize_dinov3_widgets() -> dict[str, object] | None:
                 widgets.HBox([num_epochs_widget, batch_size_widget, preview_split_widget]),
                 widgets.HBox([decoder_features_widget, patch_size_widget]),
                 widgets.HBox([use_lora_widget, lora_rank_widget]),
-                widgets.HBox([run_training_widget, run_preview_widget, run_eval_widget]),
+                widgets.HBox([run_training_widget, run_preview_widget, run_eval_widget, run_similarity_widget]),
             ]
         )
     )
@@ -594,6 +1012,7 @@ def _maybe_initialize_dinov3_widgets() -> dict[str, object] | None:
         "run_training": run_training_widget,
         "run_preview": run_preview_widget,
         "run_eval": run_eval_widget,
+        "run_similarity": run_similarity_widget,
         "preview_split": preview_split_widget,
     }
     return DINOV3_NOTEBOOK_WIDGETS
@@ -602,7 +1021,7 @@ def _maybe_initialize_dinov3_widgets() -> dict[str, object] | None:
 def apply_dinov3_widget_overrides() -> None:
     global BACKBONE_PRESET, BACKBONE_WEIGHTS_PATH, LEARNING_RATE, NUM_EPOCHS, BATCH_SIZE
     global DECODER_FEATURES, PATCH_SIZE, USE_LORA, LORA_RANK
-    global RUN_DINOV3_TRAINING, RUN_DINOV3_PREVIEW, RUN_DINOV3_EVAL, PREVIEW_SPLIT
+    global RUN_DINOV3_TRAINING, RUN_DINOV3_PREVIEW, RUN_DINOV3_EVAL, RUN_DINOV3_SIMILARITY_PREVIEW, PREVIEW_SPLIT, DINOV3_SIMILARITY_SPLIT
     widgets = _maybe_initialize_dinov3_widgets()
     if widgets is not None:
         BACKBONE_PRESET = str(widgets["backbone_preset"].value)
@@ -617,7 +1036,10 @@ def apply_dinov3_widget_overrides() -> None:
         RUN_DINOV3_TRAINING = bool(widgets["run_training"].value)
         RUN_DINOV3_PREVIEW = bool(widgets["run_preview"].value)
         RUN_DINOV3_EVAL = bool(widgets["run_eval"].value)
+        RUN_DINOV3_SIMILARITY_PREVIEW = bool(widgets["run_similarity"].value)
         PREVIEW_SPLIT = str(widgets["preview_split"].value)
+        if DINOV3_SIMILARITY_SPLIT_OVERRIDE is None:
+            DINOV3_SIMILARITY_SPLIT = PREVIEW_SPLIT
     apply_backbone_settings()
     refresh_runtime_paths()
 
@@ -756,14 +1178,371 @@ def build_split_dataset(geoai_module, manifest: pd.DataFrame, split_name: str):
     )
 
 
+def _unpack_dataset_sample(sample: object) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if isinstance(sample, dict):
+        image = sample.get("image")
+        mask = sample.get("mask")
+        if mask is None:
+            mask = sample.get("label")
+        if mask is None:
+            mask = sample.get("target")
+        return image, mask
+    if isinstance(sample, (tuple, list)) and len(sample) >= 2:
+        image = sample[0]
+        mask = sample[1]
+        return image, mask
+    return None, None
+
+
+def preview_transformed_samples(geoai_module, manifest: pd.DataFrame) -> None:
+    if not RUN_DINOV3_TRANSFORM_PREVIEW or DINOV3_TRANSFORM_PREVIEW_COUNT <= 0:
+        return
+
+    import matplotlib.pyplot as plt
+
+    preview_root = PREVIEW_ROOT / "transform_preview"
+    preview_root.mkdir(parents=True, exist_ok=True)
+    per_split = max(1, DINOV3_TRANSFORM_PREVIEW_COUNT // 3)
+
+    for split_name in ("train", "val", "test"):
+        subset = manifest[manifest["dataset_split"] == split_name].reset_index(drop=True)
+        if subset.empty:
+            continue
+        sample_rows = subset.sample(n=min(per_split, len(subset)), random_state=SEED).reset_index(drop=True)
+        dataset = geoai_module.DINOv3SegmentationDataset(
+            image_paths=[str(path) for path in sample_rows["image_abs_path"]],
+            mask_paths=[str(path) for path in sample_rows["grounded_mask_abs_path"]],
+            patch_size=PATCH_SIZE,
+            target_size=TARGET_SIZE,
+            num_channels=min(3, infer_num_channels(Path(sample_rows.iloc[0]["image_abs_path"]))),
+            transform=build_dinov3_segmentation_transform(),
+        )
+
+        for sample_index in range(len(dataset)):
+            image_tensor, mask_tensor = _unpack_dataset_sample(dataset[sample_index])
+            if image_tensor is None or mask_tensor is None:
+                continue
+
+            image = image_tensor.detach().cpu().numpy()
+            if image.ndim == 3:
+                image = np.moveaxis(image, 0, -1)
+            if image.shape[-1] > 3:
+                image = image[..., :3]
+            image = image.astype(np.float32)
+            image_min = float(np.nanmin(image))
+            image_max = float(np.nanmax(image))
+            if image_max > image_min:
+                image = (image - image_min) / (image_max - image_min)
+
+            mask = mask_tensor.detach().cpu().numpy()
+            if mask.ndim == 3:
+                mask = np.argmax(mask, axis=0)
+            mask = mask.astype(np.uint8)
+
+            fig, axes = plt.subplots(1, 2, figsize=(8, 4), squeeze=False)
+            axes = axes[0]
+            axes[0].imshow(image)
+            axes[0].set_title(f"{split_name} transformed image")
+            axes[0].set_axis_off()
+            axes[1].imshow(mask, cmap="gray", vmin=0, vmax=max(1, NUM_CLASSES - 1))
+            axes[1].set_title(f"{split_name} transformed mask")
+            axes[1].set_axis_off()
+            fig.tight_layout()
+            tile_id = str(sample_rows.iloc[sample_index]["tile_id"])
+            fig_path = preview_root / f"{split_name}_{tile_id}_transform_preview.png"
+            fig.savefig(fig_path, dpi=180, bbox_inches="tight")
+            plt.close(fig)
+
+    print(f"wrote transform previews under {preview_root.relative_to(PROJECT_ROOT)}")
+
+
+def _normalize_preview_display_image(data: np.ndarray) -> np.ndarray:
+    if data.ndim == 3:
+        if data.shape[0] <= 3:
+            display_img = np.transpose(data, (1, 2, 0))
+        else:
+            display_img = np.transpose(data[:3], (1, 2, 0))
+    else:
+        display_img = data
+
+    if display_img.dtype == np.uint8:
+        return display_img.astype(np.float32) / 255.0
+
+    display_img = display_img.astype(np.float32)
+    if display_img.ndim == 2:
+        finite = np.isfinite(display_img)
+        if not finite.any():
+            return np.zeros_like(display_img, dtype=np.float32)
+        p2, p98 = np.percentile(display_img[finite], [2, 98])
+        if p98 > p2:
+            return np.clip((display_img - p2) / (p98 - p2), 0, 1)
+        scale = 255.0 if float(np.nanmax(display_img[finite])) > 1.0 else 1.0
+        return np.clip(display_img / scale, 0, 1)
+
+    normalized = np.zeros_like(display_img, dtype=np.float32)
+    for band_index in range(display_img.shape[2]):
+        band = display_img[:, :, band_index]
+        finite = np.isfinite(band)
+        if not finite.any():
+            continue
+        p2, p98 = np.percentile(band[finite], [2, 98])
+        if p98 > p2:
+            normalized[:, :, band_index] = np.clip((band - p2) / (p98 - p2), 0, 1)
+        else:
+            scale = 255.0 if float(np.nanmax(band[finite])) > 1.0 else 1.0
+            normalized[:, :, band_index] = np.clip(band / scale, 0, 1)
+    return normalized
+
+
+def _load_positive_prompt_examples(prompt_artifact_path: Path) -> list[dict[str, object]]:
+    payload = json.loads(prompt_artifact_path.read_text())
+    prompts = payload.get("prompts") or []
+    positive_prompts: list[dict[str, object]] = []
+    for prompt in prompts:
+        matched_label_count = int(prompt.get("matched_label_count") or 0)
+        centroid = prompt.get("building_centroid_pixels") or prompt.get("centroid_pixels")
+        if matched_label_count < 1:
+            continue
+        if not isinstance(centroid, (list, tuple)) or len(centroid) != 2:
+            continue
+        positive_prompts.append(prompt)
+    return positive_prompts
+
+
+def select_similarity_rows(
+    manifest: pd.DataFrame,
+    split_name: str,
+    count: int,
+) -> list[tuple[pd.Series, dict[str, object]]]:
+    if count <= 0:
+        return []
+    if split_name == "all":
+        subset = manifest.copy()
+    else:
+        subset = manifest[manifest["dataset_split"] == split_name].copy()
+    if subset.empty:
+        return []
+
+    rng = random.Random(SEED)
+    indices = list(subset.index)
+    rng.shuffle(indices)
+    selected: list[tuple[pd.Series, dict[str, object]]] = []
+    for index in indices:
+        row = subset.loc[index]
+        prompt_path = row.get("prompt_artifact_abs_path")
+        if prompt_path is None:
+            continue
+        prompt_artifact_path = Path(prompt_path)
+        if not prompt_artifact_path.exists():
+            continue
+        try:
+            positive_prompts = _load_positive_prompt_examples(prompt_artifact_path)
+        except Exception as exc:
+            print(f"similarity preview skipped prompt artifact {prompt_artifact_path.name}: {exc}")
+            continue
+        if not positive_prompts:
+            continue
+        selected.append((row, positive_prompts[0]))
+        if len(selected) >= count:
+            break
+    return selected
+
+
+def preview_similarity_rows(manifest: pd.DataFrame) -> None:
+    if not RUN_DINOV3_SIMILARITY_PREVIEW or DINOV3_SIMILARITY_PREVIEW_COUNT <= 0:
+        return
+
+    preview_examples = select_similarity_rows(
+        manifest,
+        DINOV3_SIMILARITY_SPLIT,
+        DINOV3_SIMILARITY_PREVIEW_COUNT,
+    )
+    if not preview_examples:
+        print(
+            "DINOv3 similarity preview skipped: no OSM-positive prompt artifacts found for "
+            f"split={DINOV3_SIMILARITY_SPLIT!r}."
+        )
+        return
+
+    metadata = load_metadata()
+    configure_geoai_dinov3_weight_loaders(metadata=metadata)
+
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+        from geoai.dinov3 import DINOv3GeoProcessor, visualize_similarity_results
+    except Exception as exc:
+        print(f"DINOv3 similarity preview skipped: {exc}")
+        return
+
+    weights_path_value = metadata.get("weights_path")
+    weights_path = None
+    if isinstance(weights_path_value, str) and weights_path_value:
+        candidate = Path(weights_path_value)
+        weights_path = candidate if candidate.is_absolute() else (PROJECT_ROOT / candidate).resolve()
+
+    try:
+        processor = DINOv3GeoProcessor(
+            model_name=str(metadata["model_name"]),
+            weights_path=str(weights_path) if weights_path is not None else None,
+        )
+    except Exception as exc:
+        print(f"DINOv3 similarity preview skipped: {exc}")
+        return
+
+    similarity_root = PREVIEW_ROOT / "similarity_preview"
+    similarity_root.mkdir(parents=True, exist_ok=True)
+    rendered_count = 0
+
+    for row, prompt in preview_examples:
+        image_path = Path(row["image_abs_path"])
+        tile_id = str(row["tile_id"])
+        query_coords = prompt.get("building_centroid_pixels") or prompt.get("centroid_pixels")
+        if not isinstance(query_coords, (list, tuple)) or len(query_coords) != 2:
+            continue
+
+        tile_root = similarity_root / tile_id
+        tile_root.mkdir(parents=True, exist_ok=True)
+        quick_save_path = tile_root / f"{tile_id}_geoai_similarity.png"
+        detail_save_path = tile_root / f"{tile_id}_osm_pv_similarity_detail.png"
+        similarity_array_path = tile_root / f"{tile_id}_similarity.npy"
+        summary_path = tile_root / f"{tile_id}_similarity_summary.json"
+
+        try:
+            results = visualize_similarity_results(
+                input_image=str(image_path),
+                query_coords=(float(query_coords[0]), float(query_coords[1])),
+                output_dir=str(tile_root),
+                model_name=str(metadata["model_name"]),
+                weights_path=str(weights_path) if weights_path is not None else None,
+                colormap=DINOV3_SIMILARITY_COLORMAP,
+                alpha=DINOV3_SIMILARITY_ALPHA,
+                save_path=str(quick_save_path),
+                overlay=False,
+                target_size=DINOV3_SIMILARITY_TARGET_SIZE,
+            )
+        except Exception as exc:
+            print(f"DINOv3 similarity preview failed for {tile_id}: {exc}")
+            continue
+
+        similarity_data = np.asarray(results["image_dict"]["image"][0], dtype=np.float32)
+        np.save(similarity_array_path, similarity_data)
+        overlay_img = processor.create_similarity_overlay(
+            source=str(image_path),
+            similarity_data=similarity_data,
+            colormap=DINOV3_SIMILARITY_COLORMAP,
+            alpha=DINOV3_SIMILARITY_ALPHA,
+        )
+        image_data, _ = processor.load_image(str(image_path))
+        display_img = _normalize_preview_display_image(image_data)
+
+        matched_osm_label_ids = prompt.get("matched_osm_label_ids") or []
+        matched_label_count = int(prompt.get("matched_label_count") or len(matched_osm_label_ids))
+        bbox = prompt.get("building_bbox_pixels") or prompt.get("bbox_pixels")
+        patch_coords = tuple(int(value) for value in results["patch_coords"])
+        patch_grid_size = tuple(int(value) for value in results["patch_grid_size"])
+        sim_min = float(np.nanmin(similarity_data))
+        sim_max = float(np.nanmax(similarity_data))
+        sim_max = sim_max if sim_max > sim_min else sim_min + 1e-6
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6), squeeze=False)
+        axes = axes[0]
+        if display_img.ndim == 2:
+            axes[0].imshow(display_img, cmap="gray")
+        else:
+            axes[0].imshow(display_img)
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            x_min, y_min, x_max, y_max = (float(value) for value in bbox)
+            axes[0].add_patch(
+                Rectangle(
+                    (x_min, y_min),
+                    max(1.0, x_max - x_min),
+                    max(1.0, y_max - y_min),
+                    fill=False,
+                    edgecolor="cyan",
+                    linewidth=2.0,
+                )
+            )
+        axes[0].scatter([float(query_coords[0])], [float(query_coords[1])], c="yellow", s=42, marker="x")
+        axes[0].set_title(
+            "OSM-positive building\n"
+            f"labels={matched_label_count} ids={matched_osm_label_ids[:4]}"
+        )
+        axes[0].set_axis_off()
+
+        similarity_im = axes[1].imshow(
+            similarity_data,
+            cmap=DINOV3_SIMILARITY_COLORMAP,
+            vmin=sim_min,
+            vmax=sim_max,
+        )
+        axes[1].set_title(
+            "Patch similarity\n"
+            f"query_patch={patch_coords} grid={patch_grid_size[1]}x{patch_grid_size[0]}"
+        )
+        axes[1].set_axis_off()
+        fig.colorbar(similarity_im, ax=axes[1], fraction=0.046, pad=0.04)
+
+        if np.asarray(overlay_img).ndim == 2:
+            axes[2].imshow(overlay_img, cmap="gray")
+        else:
+            axes[2].imshow(overlay_img)
+        axes[2].set_title(f"{metadata['model_name']} overlay")
+        axes[2].set_axis_off()
+
+        fig.tight_layout()
+        fig.savefig(detail_save_path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        quick_figure = results.get("visualization")
+        if quick_figure is not None:
+            plt.close(quick_figure)
+
+        summary_payload = {
+            "tile_id": tile_id,
+            "dataset_split": str(row["dataset_split"]),
+            "image_path": row["image_path"],
+            "prompt_artifact_path": row.get("prompt_artifact_path"),
+            "model_name": metadata["model_name"],
+            "hub_weights": resolve_backbone_hub_weights_name(metadata),
+            "weights_path": metadata.get("weights_path"),
+            "query_coords": [float(query_coords[0]), float(query_coords[1])],
+            "patch_coords": list(patch_coords),
+            "patch_grid_size": list(patch_grid_size),
+            "matched_label_count": matched_label_count,
+            "matched_osm_label_ids": matched_osm_label_ids,
+            "similarity_min": sim_min,
+            "similarity_max": float(np.nanmax(similarity_data)),
+            "quick_visualization_path": _display_path(quick_save_path),
+            "detail_visualization_path": _display_path(detail_save_path),
+            "similarity_array_path": _display_path(similarity_array_path),
+        }
+        summary_path.write_text(json.dumps(summary_payload, indent=2) + "\n")
+        rendered_count += 1
+
+    if rendered_count:
+        print(
+            f"wrote {rendered_count} DINOv3 similarity previews under "
+            f"{_display_path(similarity_root)}"
+        )
+    else:
+        print("DINOv3 similarity preview finished without any rendered examples.")
+
+
 def find_latest_checkpoint(model_dir: Path) -> Path:
+    last_candidates = sorted(
+        [path for path in model_dir.rglob("last.ckpt") if path.is_file()],
+        key=lambda path: -path.stat().st_mtime,
+    )
+    if last_candidates:
+        return last_candidates[0]
+
     candidates = sorted(
         [
             path
             for path in model_dir.rglob("*")
             if path.is_file() and path.suffix.lower() in {".ckpt", ".pth", ".pt"}
         ],
-        key=lambda path: ("last" in path.name.lower(), -path.stat().st_mtime),
+        key=lambda path: -path.stat().st_mtime,
     )
     if not candidates:
         raise FileNotFoundError(f"no DINOv3 checkpoints found under {model_dir}")
@@ -782,8 +1561,11 @@ def write_metadata(num_channels: int) -> None:
     MODEL_OUT.mkdir(parents=True, exist_ok=True)
     weights_path = resolve_backbone_weights_path()
     payload = {
+        "run_name": MODEL_OUT.name,
+        "run_naming_version": RUN_NAMING_VERSION,
         "backbone_preset": BACKBONE_PRESET,
         "model_name": MODEL_NAME,
+        "hub_weights": BACKBONE_HUB_WEIGHTS,
         "weights_path": _display_path(weights_path),
         "backbone_note": BACKBONE_NOTE,
         "input_normalization_profile": INPUT_NORMALIZATION_PROFILE,
@@ -797,9 +1579,16 @@ def write_metadata(num_channels: int) -> None:
         "learning_rate": LEARNING_RATE,
         "weight_decay": WEIGHT_DECAY,
         "num_epochs": NUM_EPOCHS,
+        "lightning_precision": LIGHTNING_PRECISION,
+        "float32_matmul_precision": FLOAT32_MATMUL_PRECISION,
+        "enable_tf32": ENABLE_TF32,
+        "cudnn_benchmark": ENABLE_CUDNN_BENCHMARK,
         "freeze_backbone": FREEZE_BACKBONE,
         "use_lora": USE_LORA,
         "lora_rank": LORA_RANK,
+        "training_contract": TRAINING_CONTRACT,
+        "resume_training": RESUME_TRAINING,
+        "resume_checkpoint": _display_path(resolve_resume_checkpoint()),
     }
     METADATA_PATH.write_text(json.dumps(payload, indent=2) + "\n")
 
@@ -809,8 +1598,11 @@ def load_metadata() -> dict[str, object]:
         return json.loads(METADATA_PATH.read_text())
     weights_path = resolve_backbone_weights_path()
     return {
+        "run_name": MODEL_OUT.name,
+        "run_naming_version": RUN_NAMING_VERSION,
         "backbone_preset": BACKBONE_PRESET,
         "model_name": MODEL_NAME,
+        "hub_weights": BACKBONE_HUB_WEIGHTS,
         "weights_path": _display_path(weights_path),
         "backbone_note": BACKBONE_NOTE,
         "input_normalization_profile": INPUT_NORMALIZATION_PROFILE,
@@ -824,9 +1616,16 @@ def load_metadata() -> dict[str, object]:
         "learning_rate": LEARNING_RATE,
         "weight_decay": WEIGHT_DECAY,
         "num_epochs": NUM_EPOCHS,
+        "lightning_precision": LIGHTNING_PRECISION,
+        "float32_matmul_precision": FLOAT32_MATMUL_PRECISION,
+        "enable_tf32": ENABLE_TF32,
+        "cudnn_benchmark": ENABLE_CUDNN_BENCHMARK,
         "freeze_backbone": FREEZE_BACKBONE,
         "use_lora": USE_LORA,
         "lora_rank": LORA_RANK,
+        "training_contract": TRAINING_CONTRACT,
+        "resume_training": RESUME_TRAINING,
+        "resume_checkpoint": _display_path(resolve_resume_checkpoint()),
     }
 
 
@@ -866,6 +1665,8 @@ def preview_training_rows(geoai_module, manifest: pd.DataFrame, checkpoint_path:
         print(f"no rows found for preview split={PREVIEW_SPLIT!r}")
         return
 
+    runtime = build_dinov3_inference_runtime(checkpoint_path, metadata)
+
     for row in preview_rows.itertuples(index=False):
         output_stem = PREVIEW_ROOT / f"{PREVIEW_SPLIT}_{Path(row.image_path).stem}"
         predicted_mask_path = output_stem.with_name(f"{output_stem.name}_pred.tif")
@@ -877,6 +1678,8 @@ def preview_training_rows(geoai_module, manifest: pd.DataFrame, checkpoint_path:
             window_size=PREVIEW_WINDOW_SIZE,
             overlap=PREVIEW_OVERLAP,
             batch_size=PREVIEW_BATCH_SIZE,
+            runtime=runtime,
+            progress_desc=f"DINOv3 windows | {Path(row.image_path).stem}",
         )
         render_prediction_review_bundle(
             image_path=Path(row.image_abs_path),
@@ -895,6 +1698,8 @@ def preview_external_rows(geoai_module, manifest: pd.DataFrame, checkpoint_path:
         print("no external preview rasters found.")
         return
 
+    runtime = build_dinov3_inference_runtime(checkpoint_path, metadata)
+
     for image_path in external_candidates[:EXTERNAL_PREVIEW_COUNT]:
         output_stem = PREVIEW_ROOT / f"external_{image_path.stem}"
         predicted_mask_path = output_stem.with_name(f"{output_stem.name}_pred.tif")
@@ -907,6 +1712,8 @@ def preview_external_rows(geoai_module, manifest: pd.DataFrame, checkpoint_path:
             window_size=PREVIEW_WINDOW_SIZE,
             overlap=PREVIEW_OVERLAP,
             batch_size=PREVIEW_BATCH_SIZE,
+            runtime=runtime,
+            progress_desc=f"DINOv3 windows | {image_path.stem}",
         )
         render_prediction_review_bundle(
             image_path=image_path,
@@ -948,6 +1755,7 @@ def evaluate_split_rows(geoai_module, manifest: pd.DataFrame, checkpoint_path: P
         return pd.DataFrame(), pd.DataFrame()
 
     EVAL_ROOT.mkdir(parents=True, exist_ok=True)
+    runtime = build_dinov3_inference_runtime(checkpoint_path, metadata)
     records: list[dict[str, object]] = []
     for row_index, row in enumerate(eval_rows.itertuples(index=False)):
         split_root = EVAL_ROOT / row.dataset_split
@@ -962,7 +1770,9 @@ def evaluate_split_rows(geoai_module, manifest: pd.DataFrame, checkpoint_path: P
             metadata=metadata,
             window_size=PREVIEW_WINDOW_SIZE,
             overlap=PREVIEW_OVERLAP,
-            batch_size=PREVIEW_BATCH_SIZE,
+            batch_size=EVAL_BATCH_SIZE,
+            runtime=runtime,
+            progress_desc=f"DINOv3 eval windows | {Path(row.image_path).stem}",
         )
         metrics = compute_binary_mask_metrics(predicted_mask_path, Path(row.grounded_mask_abs_path))
 
@@ -1005,12 +1815,66 @@ def evaluate_split_rows(geoai_module, manifest: pd.DataFrame, checkpoint_path: P
     write_evaluation_summary(metrics_df, building_metrics_df)
     return metrics_df, building_metrics_df
 
+
+def render_test_detection_gallery(manifest: pd.DataFrame, metrics_df: pd.DataFrame) -> None:
+    if not RUN_DINOV3_TEST_DETECTION_PREVIEW or TEST_DETECTION_SAMPLE_COUNT <= 0 or metrics_df.empty:
+        return
+
+    test_rows = metrics_df[metrics_df["dataset_split"] == "test"].copy()
+    if test_rows.empty:
+        print("test detection gallery skipped: no test rows in evaluation output.")
+        return
+
+    detection_rows = test_rows[
+        (test_rows["pred_positive_pixels"] > 0) | (test_rows["target_positive_pixels"] > 0)
+    ].copy()
+    if detection_rows.empty:
+        print("test detection gallery skipped: no PV detections found in test split.")
+        return
+
+    detection_rows = detection_rows.sort_values(
+        ["pred_positive_pixels", "target_positive_pixels", "iou"],
+        ascending=[False, False, False],
+        kind="stable",
+    ).head(TEST_DETECTION_SAMPLE_COUNT)
+
+    gallery_root = EVAL_ROOT / "test_detection_gallery"
+    gallery_root.mkdir(parents=True, exist_ok=True)
+    manifest_by_tile = manifest.set_index("tile_id", drop=False)
+
+    for row in detection_rows.itertuples(index=False):
+        if row.tile_id not in manifest_by_tile.index:
+            continue
+        manifest_row = manifest_by_tile.loc[row.tile_id]
+        if isinstance(manifest_row, pd.DataFrame):
+            manifest_row = manifest_row.iloc[0]
+
+        predicted_mask_path = (PROJECT_ROOT / str(row.predicted_mask_path)).resolve()
+        if not predicted_mask_path.exists():
+            continue
+
+        output_stem = gallery_root / f"test_{row.tile_id}"
+        render_prediction_review_bundle(
+            image_path=Path(manifest_row["image_abs_path"]),
+            output_stem=output_stem,
+            predicted_mask_path=predicted_mask_path,
+            raw_mask_path=Path(manifest_row["raw_mask_abs_path"]) if manifest_row.get("raw_mask_abs_path") else None,
+            grounded_mask_path=Path(manifest_row["grounded_mask_abs_path"]),
+            suptitle=f"DINOv3 test detection | {row.tile_id}",
+        )
+    print(
+        f"wrote test detection gallery for {len(detection_rows):,} tiles under "
+        f"{gallery_root.relative_to(PROJECT_ROOT)}"
+    )
+
 # %%
 if __name__ == "__main__":
     apply_dinov3_widget_overrides()
     validate_dinov3_runtime_configuration()
+    configure_torch_gpu_performance()
 
     manifest = load_grounded_manifest(TRAIN_MANIFEST)
+    apply_manifest_training_contract(manifest)
     summarize_manifest(manifest)
 
     split_counts = manifest["dataset_split"].value_counts().to_dict()
@@ -1020,18 +1884,33 @@ if __name__ == "__main__":
     sample_image = Path(manifest.iloc[0]["image_abs_path"])
     num_channels = min(3, infer_num_channels(sample_image))
     print(f"sample image: {sample_image.name} | channels used: {num_channels}")
-    print(f"backbone preset: {BACKBONE_PRESET} | hub model: {MODEL_NAME} | normalization: {INPUT_NORMALIZATION_PROFILE}")
+    print(
+        f"backbone preset: {BACKBONE_PRESET} | hub model: {MODEL_NAME} | "
+        f"hub weights: {BACKBONE_HUB_WEIGHTS} | normalization: {INPUT_NORMALIZATION_PROFILE}"
+    )
     if BACKBONE_WEIGHTS_PATH is None and BACKBONE_PRESET == "vitl16_sat493m":
         print("backbone weights: GeoAI SAT-493M default (.pth auto-resolved by geoai)")
     elif BACKBONE_WEIGHTS_PATH is not None:
         print(f"backbone weights: {BACKBONE_WEIGHTS_PATH}")
+    else:
+        print(
+            "backbone weights: official DINOv3 auto-resolution for "
+            f"{BACKBONE_HUB_WEIGHTS} (set GEOAI_DINOV3_WEIGHTS_PATH to override with a local .pth)"
+        )
     print(f"model output dir: {MODEL_OUT}")
+    resume_checkpoint = ensure_resume_compatible()
+    if resume_checkpoint is not None:
+        print(f"resume checkpoint: {resume_checkpoint}")
     write_metadata(num_channels)
 
     import geoai
 
+    configure_geoai_dinov3_weight_loaders(metadata=load_metadata())
+
     train_dataset = build_split_dataset(geoai, manifest, "train")
     val_dataset = build_split_dataset(geoai, manifest, "val")
+    preview_transformed_samples(geoai, manifest)
+    preview_similarity_rows(manifest)
     if train_dataset is None:
         raise RuntimeError("no train split found in grounded manifest")
     if val_dataset is None:
@@ -1039,7 +1918,7 @@ if __name__ == "__main__":
 
     print(
         f"DINOv3 preflight complete | model={MODEL_NAME} | epochs={NUM_EPOCHS} | "
-        f"freeze_backbone={FREEZE_BACKBONE} | use_lora={USE_LORA}"
+        f"freeze_backbone={FREEZE_BACKBONE} | use_lora={USE_LORA} | precision={LIGHTNING_PRECISION}"
     )
 
     if RUN_DINOV3_TRAINING:
@@ -1063,6 +1942,8 @@ if __name__ == "__main__":
             accelerator=ACCELERATOR,
             devices=DEVICES,
             patience=EARLY_STOPPING_PATIENCE,
+            checkpoint_path=str(resume_checkpoint) if resume_checkpoint is not None else None,
+            precision=LIGHTNING_PRECISION,
         )
         write_metadata(num_channels)
         print(f"DINOv3 training complete under {MODEL_OUT}")
@@ -1089,6 +1970,7 @@ if __name__ == "__main__":
                         .reset_index()
                         .to_string(index=False)
                     )
+                    render_test_detection_gallery(manifest, evaluation_metrics)
                 if not building_metrics.empty:
                     print("holdout building metrics by split:")
                     print(
@@ -1104,6 +1986,7 @@ if __name__ == "__main__":
                     )
 
 # %%
+
 
 
 

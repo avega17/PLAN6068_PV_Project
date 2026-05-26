@@ -9,9 +9,13 @@ outputs/geoparquet/*
 outputs/figures/review
 outputs/figures/*.svg
 outputs/geoai_*/*
+outputs/maps/geoai_inference/*.csv
+outputs/maps/geoai_inference/*.geojson
+outputs/maps/geoai_inference/*_inference_*.png
 # still WIP and way too large
 outputs/maps/pr_urban_all_geographies_preview.html
 outputs/models/*
+outputs/reports/*.parquet
 outputs/sam_*
 outputs/stac_tiles/*
 **/overture_bounding_boxes/

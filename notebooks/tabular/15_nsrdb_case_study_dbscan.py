@@ -1,14 +1,14 @@
 # %% [markdown]
-# # Case-Study Block-Group DBSCAN Appendix
+# # Case-Study Tract DBSCAN Appendix
 #
-# Clusters San Juan + Isabela census block groups from the rebuilt BG aggregate
+# Clusters San Juan + Isabela census tracts from the rebuilt tract aggregate
 # surface instead of the earlier NSRDB point-site surface. This keeps clustering
 # in the appendix while aligning the unit of analysis with the core ESDA path.
 #
 # Outputs:
-# - `outputs/reports/san_juan_isabela_bg_dbscan_clusters.parquet`
-# - `outputs/reports/san_juan_isabela_bg_dbscan_summary.csv`
-# - `outputs/maps/san_juan_isabela_bg_dbscan_clusters.png`
+# - `outputs/reports/san_juan_isabela_tract_dbscan_clusters.parquet`
+# - `outputs/reports/san_juan_isabela_tract_dbscan_summary.csv`
+# - `outputs/maps/san_juan_isabela_tract_dbscan_clusters.png`
 
 # %%
 """15_nsrdb_case_study_dbscan.py"""
@@ -48,28 +48,31 @@ from utils.census import resolve_vector_db_path
 TARGET_MUNICIPALITIES = ("San Juan", "Isabela")
 TARGET_SCOPE_STEM = "_".join(municipio.lower().replace(" ", "_") for municipio in TARGET_MUNICIPALITIES)
 ANALYSIS_CRS = "EPSG:32619"
-BG_AGG_TABLE = "pr_pv_bg_aggregates"
+AGG_TABLE = "pr_pv_tract_aggregates"
+GEOGRAPHY_TABLE = "pr_census_tracts"
+GEOGRAPHY_ID_COLUMN = "tract_geoid"
 PREFERRED_FEATURE_COLUMNS = (
-    "any_pv_signal_rate",
-    "osm_pv_rate",
-    "detected_pv_rate",
-    "annual_flux_mean_kwh_per_kw_yr",
-    "nsrdb_ghi_mean",
+    "any_pv_evidence_buildings_per_1000",
+    "osm_labeled_buildings_per_1000",
+    "detected_pv_buildings_per_1000",
+    "nsrdb_multiyear_ghi_mean",
     "median_household_income_usd",
     "pct_bachelor_plus",
     "pct_owner_occupied",
-    "diversity_index",
-    "pct_urban_population",
+    "pct_spanish_english_well_18_64",
+    "pct_spanish_english_not_at_all_18_64",
+    "cdc_svi_2020_overall_percentile",
+    "pct_urban_land_area",
 )
-DEFAULT_MIN_SAMPLES = int(os.getenv("CASE_STUDY_BG_DBSCAN_MIN_SAMPLES", "5") or "5")
-DEFAULT_EPS_QUANTILE = float(os.getenv("CASE_STUDY_BG_DBSCAN_EPS_QUANTILE", "0.9") or "0.9")
+DEFAULT_MIN_SAMPLES = int(os.getenv("CASE_STUDY_TRACT_DBSCAN_MIN_SAMPLES", os.getenv("CASE_STUDY_BG_DBSCAN_MIN_SAMPLES", "5")) or "5")
+DEFAULT_EPS_QUANTILE = float(os.getenv("CASE_STUDY_TRACT_DBSCAN_EPS_QUANTILE", os.getenv("CASE_STUDY_BG_DBSCAN_EPS_QUANTILE", "0.9")) or "0.9")
 COORDINATE_WEIGHT = float(os.getenv("CASE_STUDY_BG_DBSCAN_COORDINATE_WEIGHT", "0.25") or "0.25")
 
 REPORT_DIR = PROJECT_ROOT / "outputs" / "reports"
 MAP_DIR = PROJECT_ROOT / "outputs" / "maps"
-CLUSTER_OUTPUT_PATH = REPORT_DIR / f"{TARGET_SCOPE_STEM}_bg_dbscan_clusters.parquet"
-SUMMARY_OUTPUT_PATH = REPORT_DIR / f"{TARGET_SCOPE_STEM}_bg_dbscan_summary.csv"
-MAP_OUTPUT_PATH = MAP_DIR / f"{TARGET_SCOPE_STEM}_bg_dbscan_clusters.png"
+CLUSTER_OUTPUT_PATH = REPORT_DIR / f"{TARGET_SCOPE_STEM}_tract_dbscan_clusters.parquet"
+SUMMARY_OUTPUT_PATH = REPORT_DIR / f"{TARGET_SCOPE_STEM}_tract_dbscan_summary.csv"
+MAP_OUTPUT_PATH = MAP_DIR / f"{TARGET_SCOPE_STEM}_tract_dbscan_clusters.png"
 
 
 def resolve_db_path() -> Path:
@@ -92,16 +95,16 @@ def _to_bytes(value: object) -> bytes:
     return bytes(value)
 
 
-def load_bg_cluster_surface(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame:
+def load_cluster_surface(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame:
     has_table = bool(
         con.execute(
             "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?;",
-            [BG_AGG_TABLE],
+            [AGG_TABLE],
         ).fetchone()[0]
     )
     if not has_table:
         raise RuntimeError(
-            f"{BG_AGG_TABLE} is missing. Rebuild the block-group aggregate with notebooks/tabular/14_pv_bg_aggregation.py first."
+            f"{AGG_TABLE} is missing. Rebuild the tract aggregate with notebooks/tabular/14_pv_bg_aggregation.py first."
         )
 
     names_sql = ", ".join("?" * len(TARGET_MUNICIPALITIES))
@@ -109,17 +112,17 @@ def load_bg_cluster_surface(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame:
         f"""
         SELECT
             agg.*,
-            ST_AsWKB(bg.geometry) AS geometry_wkb
-        FROM {BG_AGG_TABLE} AS agg
-        JOIN pr_census_block_groups AS bg
-          ON bg.GEOID = agg.bg_geoid
+                        ST_AsWKB(geom.geometry) AS geometry_wkb
+                FROM {AGG_TABLE} AS agg
+                JOIN {GEOGRAPHY_TABLE} AS geom
+                    ON geom.GEOID = agg.{GEOGRAPHY_ID_COLUMN}
         WHERE agg.municipio IN ({names_sql})
-        ORDER BY agg.municipio, agg.bg_geoid;
+                ORDER BY agg.municipio, agg.{GEOGRAPHY_ID_COLUMN};
         """,
         list(TARGET_MUNICIPALITIES),
     ).fetchdf()
     if frame.empty:
-        raise RuntimeError("The BG aggregate exists but returned no rows for San Juan and Isabela.")
+                raise RuntimeError("The tract aggregate exists but returned no rows for San Juan and Isabela.")
 
     geometry = gpd.GeoSeries.from_wkb(frame["geometry_wkb"].map(_to_bytes), crs="EPSG:4326")
     return gpd.GeoDataFrame(frame.drop(columns=["geometry_wkb"]), geometry=geometry, crs="EPSG:4326")
@@ -135,7 +138,7 @@ def resolve_feature_columns(frame: pd.DataFrame) -> list[str]:
 
     if not feature_columns:
         raise RuntimeError(
-            "No BG clustering feature columns were found. Expected one or more of: "
+            "No tract clustering feature columns were found. Expected one or more of: "
             + ", ".join(PREFERRED_FEATURE_COLUMNS)
         )
     return feature_columns
@@ -189,19 +192,19 @@ def estimate_dbscan_eps(
 
 
 def run_dbscan_by_municipality(
-    bg_gdf: gpd.GeoDataFrame,
+    analysis_gdf: gpd.GeoDataFrame,
     *,
     min_samples: int = DEFAULT_MIN_SAMPLES,
     eps_quantile: float = DEFAULT_EPS_QUANTILE,
     coordinate_weight: float = COORDINATE_WEIGHT,
 ) -> gpd.GeoDataFrame:
-    if bg_gdf.empty:
-        return bg_gdf.copy()
+    if analysis_gdf.empty:
+        return analysis_gdf.copy()
 
-    feature_columns = resolve_feature_columns(bg_gdf)
+    feature_columns = resolve_feature_columns(analysis_gdf)
     clustered_frames: list[gpd.GeoDataFrame] = []
 
-    for municipio, subset in bg_gdf.groupby("municipio", sort=False):
+    for municipio, subset in analysis_gdf.groupby("municipio", sort=False):
         subset = subset.copy()
         if len(subset) < max(3, min_samples):
             subset["cluster_id"] = -1
@@ -247,7 +250,7 @@ def run_dbscan_by_municipality(
         how="left",
     )
     clustered["cluster_size"] = clustered["cluster_size"].fillna(0).astype(int)
-    return gpd.GeoDataFrame(clustered, geometry="geometry", crs=bg_gdf.crs)
+    return gpd.GeoDataFrame(clustered, geometry="geometry", crs=analysis_gdf.crs)
 
 
 def summarize_clusters(clustered: gpd.GeoDataFrame) -> pd.DataFrame:
@@ -256,7 +259,7 @@ def summarize_clusters(clustered: gpd.GeoDataFrame) -> pd.DataFrame:
 
     feature_columns = resolve_feature_columns(clustered)
     aggregations: dict[str, tuple[str, str]] = {
-        "bg_count": ("bg_geoid", "size"),
+        "tract_count": (GEOGRAPHY_ID_COLUMN, "size"),
         "building_count": ("building_count", "sum"),
         "dbscan_eps": ("dbscan_eps", "first"),
         "dbscan_min_samples": ("dbscan_min_samples", "first"),
@@ -279,7 +282,7 @@ def plot_cluster_map(
     output_path: Path = MAP_OUTPUT_PATH,
 ) -> None:
     if clustered.empty:
-        print("cluster map skipped: clustered BG surface is empty.")
+        print("cluster map skipped: clustered tract surface is empty.")
         return
 
     fig, axes = plt.subplots(1, len(TARGET_MUNICIPALITIES), figsize=(14, 7), constrained_layout=True)
@@ -315,7 +318,7 @@ def plot_cluster_map(
             )
 
         subset.boundary.plot(ax=ax, color="#111111", linewidth=0.25)
-        ax.set_title(f"{municipio} BG DBSCAN appendix")
+        ax.set_title(f"{municipio} tract DBSCAN appendix")
         ax.set_axis_off()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -327,24 +330,24 @@ def plot_cluster_map(
 if __name__ == "__main__":
     db_path = resolve_db_path()
     con = connect(db_path)
-    bg_surface = load_bg_cluster_surface(con)
+    analysis_surface = load_cluster_surface(con)
     con.close()
 
-    feature_columns = resolve_feature_columns(bg_surface)
-    print(f"loaded {len(bg_surface):,} BG rows for {', '.join(TARGET_MUNICIPALITIES)}")
+    feature_columns = resolve_feature_columns(analysis_surface)
+    print(f"loaded {len(analysis_surface):,} tract rows for {', '.join(TARGET_MUNICIPALITIES)}")
     print(f"feature columns: {', '.join(feature_columns)}")
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     MAP_DIR.mkdir(parents=True, exist_ok=True)
 
-    clustered_bg = run_dbscan_by_municipality(bg_surface)
-    cluster_summary = summarize_clusters(clustered_bg)
+    clustered_surface = run_dbscan_by_municipality(analysis_surface)
+    cluster_summary = summarize_clusters(clustered_surface)
 
-    clustered_bg.to_parquet(CLUSTER_OUTPUT_PATH, index=False)
+    clustered_surface.to_parquet(CLUSTER_OUTPUT_PATH, index=False)
     cluster_summary.to_csv(SUMMARY_OUTPUT_PATH, index=False)
-    plot_cluster_map(clustered_bg, MAP_OUTPUT_PATH)
+    plot_cluster_map(clustered_surface, MAP_OUTPUT_PATH)
 
-    print(f"clustered BG parquet: {CLUSTER_OUTPUT_PATH}")
+    print(f"clustered tract parquet: {CLUSTER_OUTPUT_PATH}")
     print(f"cluster summary csv: {SUMMARY_OUTPUT_PATH}")
     if not cluster_summary.empty:
         print(cluster_summary.to_string(index=False))

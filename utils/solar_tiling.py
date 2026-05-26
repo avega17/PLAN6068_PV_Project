@@ -19,8 +19,8 @@ from typing import Iterable
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+from shapely import union_all
 from shapely.geometry import Point, Polygon
-from shapely.ops import unary_union
 
 DEFAULT_RADIUS_M = 175
 DEFAULT_SPACING_M = int(round(DEFAULT_RADIUS_M * math.sqrt(2)))  # ~247 m
@@ -156,7 +156,7 @@ def attach_h3_priority(
 
     if seed_neighborhoods is not None and not seed_neighborhoods.empty:
         seeds = seed_neighborhoods.to_crs("EPSG:4326")
-        seed_union = unary_union(seeds.geometry.values)
+        seed_union = union_all(seeds.geometry.tolist())
         result["priority_score"] = result["priority_score"].where(~result.geometry.intersects(seed_union), 3)
 
     result["osm_pv_count"] = result["osm_pv_count"].fillna(0).astype(int)
@@ -331,7 +331,7 @@ def attach_priority(
 
     if seed_neighborhoods is not None and not seed_neighborhoods.empty:
         seeds = seed_neighborhoods.to_crs("EPSG:4326")
-        seed_union = unary_union(seeds.geometry.values)
+        seed_union = union_all(seeds.geometry.tolist())
         result["priority_score"] = result["priority_score"].where(
             ~result.geometry.intersects(seed_union), 3
         )

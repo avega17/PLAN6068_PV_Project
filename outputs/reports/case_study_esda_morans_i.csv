@@ -1,0 +1,7 @@
+metric,municipio,weights,n_tracts,morans_I,p_sim,z_sim
+any_pv_evidence_buildings_per_1000,Isabela,queen,11,-0.08950362729386845,0.412,0.1044016303586722
+any_pv_evidence_buildings_per_1000,San Juan,queen,137,0.4101817791598392,0.001,7.939636553511582
+detected_pv_buildings_per_1000,Isabela,queen,11,0.12936158607956344,0.114,1.2398589325740001
+detected_pv_buildings_per_1000,San Juan,queen,137,0.36414805934456906,0.001,7.0044215298351284
+osm_labeled_buildings_per_1000,Isabela,queen,11,-0.12076762602336415,0.5,-0.17059949925657503
+osm_labeled_buildings_per_1000,San Juan,queen,137,0.6011566547144448,0.001,12.121258902856898
