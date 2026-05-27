@@ -119,7 +119,7 @@ PUBLIC_METRIC_LABELS = {
     "pct_bachelor_plus": "Share age 25+ with Bachelor's or higher",
     "pct_spanish_english_well_18_64": "Share of Spanish-speaking adults 18-64 who speak English well",
     "pct_spanish_english_not_at_all_18_64": "Share of Spanish-speaking adults 18-64 who speak no English",
-    "cdc_svi_2020_overall_percentile": "CDC SVI 2020 overall percentile (0-100)",
+    "cdc_svi_2020_overall_percentile": "CDC SVI 2020 overall percentile rank (0-100)",
     "pct_urban_land_area": "Urban land-area share",
 }
 
@@ -190,11 +190,11 @@ MAP_FIGURE_SPECS: tuple[dict[str, str], ...] = (
     },
     {
         "column": "cdc_svi_2020_overall_percentile",
-        "title": "CDC SVI 2020 overall percentile (0-100)",
+        "title": "CDC SVI 2020 overall percentile rank (0-100)",
         "filename": "cdc_svi_2020_overall_percentile_choropleth.png",
         "cmap": "magma",
-        "what": "The CDC/ATSDR Social Vulnerability Index overall percentile for 2020 Puerto Rico tracts, scaled from 0 to 100.",
-        "why": "This replaces the earlier diversity-index map with an established public-health vulnerability measure that is much more interpretable in the Puerto Rico planning context.",
+        "what": "The CDC/ATSDR 2020 overall vulnerability ranking variable `RPL_THEMES`, rescaled from its native 0-1 percentile rank to 0-100 for easier public reading.",
+        "why": "CDC guidance identifies `RPL_THEMES` as the overall ranking variable for social vulnerability; the raw `SPL_THEMES` sum is an intermediate score, so the percentile rank is the more interpretable public-facing map.",
     },
     {
         "column": "pct_urban_land_area",
@@ -411,12 +411,25 @@ def load_cdc_svi_2020_tracts() -> pd.DataFrame:
         raise RuntimeError("CDC SVI 2020 tract file loaded but returned no rows.")
 
     frame[AGG_GEOID_COLUMN] = frame["FIPS"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(11)
-    output = frame[[AGG_GEOID_COLUMN, "LOCATION", "RPL_THEMES"]].copy()
+    output = frame[[AGG_GEOID_COLUMN, "LOCATION", "SPL_THEMES", "RPL_THEMES"]].copy()
     output = output.rename(columns={"LOCATION": "cdc_svi_2020_location"})
+    theme_rank_sum = pd.to_numeric(output["SPL_THEMES"], errors="coerce")
+    theme_rank_sum = theme_rank_sum.mask(theme_rank_sum < 0)
+    output["cdc_svi_2020_theme_rank_sum"] = theme_rank_sum
+
+    # CDC/ATSDR documents RPL_THEMES as the official overall ranking variable.
+    # SPL_THEMES is the summed intermediate score used before percentile ranking.
     svi_percentile = pd.to_numeric(output["RPL_THEMES"], errors="coerce")
     svi_percentile = svi_percentile.mask(svi_percentile < 0)
     output["cdc_svi_2020_overall_percentile"] = svi_percentile * 100.0
-    return output[[AGG_GEOID_COLUMN, "cdc_svi_2020_location", "cdc_svi_2020_overall_percentile"]].copy()
+    return output[
+        [
+            AGG_GEOID_COLUMN,
+            "cdc_svi_2020_location",
+            "cdc_svi_2020_theme_rank_sum",
+            "cdc_svi_2020_overall_percentile",
+        ]
+    ].copy()
 
 
 def load_local_acs_tracts(con: duckdb.DuckDBPyConnection) -> tuple[int, pd.DataFrame]:
@@ -654,6 +667,7 @@ def write_indicator_guide(gdf: gpd.GeoDataFrame, output_path: Path) -> None:
         "",
         "This note explains the tract maps and Moran diagnostics exported by `14_pv_bg_aggregation.py`.",
         "Public-facing PV indicators are scaled per 1,000 buildings so readers do not have to interpret very small decimals.",
+        "For CDC SVI, the map uses the official overall ranking variable `RPL_THEMES`, which CDC defines as a percentile rank; the notebook rescales that rank from 0-1 to 0-100 for readability.",
         "",
     ]
 

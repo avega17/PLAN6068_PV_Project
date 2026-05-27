@@ -2,6 +2,7 @@
 
 This note explains the tract maps and Moran diagnostics exported by `14_pv_bg_aggregation.py`.
 Public-facing PV indicators are scaled per 1,000 buildings so readers do not have to interpret very small decimals.
+For CDC SVI, the map uses the official overall ranking variable `RPL_THEMES`, which CDC defines as a percentile rank; the notebook rescales that rank from 0-1 to 0-100 for readability.
 
 ## Buildings with any PV evidence per 1,000 buildings
 
@@ -59,11 +60,11 @@ Public-facing PV indicators are scaled per 1,000 buildings so readers do not hav
 - How to read it: This is the opposite bilingual-capacity extreme and helps interpret where language access barriers may align with lower rooftop-PV uptake.
 - Observed range across case-study tracts: San Juan: 0.00 to 0.67; Isabela: 0.15 to 0.46
 
-## CDC SVI 2020 overall percentile (0-100)
+## CDC SVI 2020 overall percentile rank (0-100)
 
 - Output file: `outputs/maps/cdc_svi_2020_overall_percentile_choropleth.png`
-- What it measures: The CDC/ATSDR Social Vulnerability Index overall percentile for 2020 Puerto Rico tracts, scaled from 0 to 100.
-- How to read it: This replaces the earlier diversity-index map with an established public-health vulnerability measure that is much more interpretable in the Puerto Rico planning context.
+- What it measures: The CDC/ATSDR 2020 overall vulnerability ranking variable `RPL_THEMES`, rescaled from its native 0-1 percentile rank to 0-100 for easier public reading.
+- How to read it: CDC guidance identifies `RPL_THEMES` as the overall ranking variable for social vulnerability; the raw `SPL_THEMES` sum is an intermediate score, so the percentile rank is the more interpretable public-facing map.
 - Observed range across case-study tracts: San Juan: 0.33 to 99.67; Isabela: 22.45 to 83.95
 
 ## Urban land-area share
