@@ -12,6 +12,9 @@ outputs/geoai_*/*
 outputs/maps/geoai_inference/*.csv
 outputs/maps/geoai_inference/*.geojson
 outputs/maps/geoai_inference/*_inference_*.png
+# notebook.link publish branch: drop rendered research notebooks but keep room
+# for a tracked slide deck under notebooks/slides/ later.
+notebooks/**/*.ipynb
 # still WIP and way too large
 outputs/maps/pr_urban_all_geographies_preview.html
 outputs/models/*
