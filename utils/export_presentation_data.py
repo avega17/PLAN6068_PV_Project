@@ -21,6 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "PR_PV_plan_data.duckdb"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "presentation"
 DEFAULT_MAX_BUILDING_BYTES = 9_000_000
+SAN_JUAN_EXTRA_SAMPLE_FRACTION = 0.5
 OUTPUT_CRS = "EPSG:4326"
 PLOT_CRS = "EPSG:3857"
 CASE_MUNICIPALITIES = ("San Juan", "Isabela")
@@ -348,8 +349,9 @@ def select_sampled_buildings_under_limit(
     gdf: gpd.GeoDataFrame,
     output_path: Path,
     max_building_bytes: int,
+    extra_row_fraction: float = 1.0,
 ) -> dict[str, int]:
-    """Write all Puerto Nuevo buildings plus the largest deterministic San Juan sample under a byte limit."""
+    """Write all Puerto Nuevo buildings plus a deterministic San Juan sample under a byte limit."""
 
     puerto_nuevo = gdf[gdf["in_puerto_nuevo"]].copy()
     san_juan_sample_pool = gdf[~gdf["in_puerto_nuevo"]].copy()
@@ -370,11 +372,16 @@ def select_sampled_buildings_under_limit(
         else:
             high = midpoint - 1
 
-    selected = pd.concat([puerto_nuevo, san_juan_sample_pool.head(best_extra_rows)], ignore_index=True)
+    selected_extra_rows = best_extra_rows
+    if best_extra_rows:
+        selected_extra_rows = max(1, int(best_extra_rows * extra_row_fraction))
+
+    selected = pd.concat([puerto_nuevo, san_juan_sample_pool.head(selected_extra_rows)], ignore_index=True)
     write_buildings_parquet(selected, output_path)
     return {
         "puerto_nuevo_rows": int(len(puerto_nuevo)),
-        "extra_san_juan_sample_rows": int(best_extra_rows),
+        "max_extra_san_juan_sample_rows": int(best_extra_rows),
+        "selected_extra_san_juan_sample_rows": int(selected_extra_rows),
         "selected_rows": int(len(selected)),
         "selected_bytes": int(file_size(output_path) or best_size),
     }
@@ -421,7 +428,12 @@ def export_building_candidates(
             row_extras: dict[str, object] = {}
             if scope == "san_juan_puerto_nuevo_sample":
                 gdf, label = fetch_san_juan_puerto_nuevo_buildings(con, output_dir)
-                sample_stats = select_sampled_buildings_under_limit(gdf, parquet_path, max_building_bytes)
+                sample_stats = select_sampled_buildings_under_limit(
+                    gdf,
+                    parquet_path,
+                    max_building_bytes,
+                    extra_row_fraction=SAN_JUAN_EXTRA_SAMPLE_FRACTION,
+                )
                 selected_gdf = pd.read_parquet(parquet_path)
                 geometry = gpd.GeoSeries.from_wkb(selected_gdf["geometry"].map(_to_bytes), crs=OUTPUT_CRS)
                 gdf = gpd.GeoDataFrame(selected_gdf.drop(columns="geometry"), geometry=geometry, crs=OUTPUT_CRS)
@@ -475,7 +487,6 @@ def main() -> None:
     manifest["research_database_summary_rows"] = export_database_summary(con, output_dir)
     manifest.update(export_core_vectors(con, output_dir))
     manifest.update(export_building_candidates(con, output_dir, args.max_building_bytes, keep_candidate_files=args.keep_duckdb))
-    manifest["stac_footprint_count"] = export_stac_subset(output_dir)
     con.close()
 
     output_files = sorted(path for path in output_dir.rglob("*") if path.is_file())

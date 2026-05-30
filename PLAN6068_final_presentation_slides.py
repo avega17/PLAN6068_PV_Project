@@ -574,7 +574,7 @@ display_case_study_micro_map()
 # 
 # <ul class="tight-list">
 # <li>Raw footprints were ingested locally with DuckDB Spatial and Overture tooling.</li>
-# <li>The interactive preview prioritizes urban density: all 16,557 Puerto Nuevo buildings plus 60,349 sampled San Juan buildings.</li>
+# <li>The interactive preview prioritizes urban density: all Puerto Nuevo buildings plus a reduced deterministic San Juan sample.</li>
 # <li>Footprints provide the denominator for comparing PV evidence across neighborhoods instead of relying on raw detection counts.</li>
 # </ul>
 
