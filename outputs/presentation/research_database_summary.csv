@@ -1,0 +1,12 @@
+summary_group,component,source_table,record_count,planning_use
+Spatial frame,Puerto Rico municipalities,pr_census_counties,78,Municipal boundaries used for case-study selection and joining datasets by municipio.
+Spatial frame,Census tracts,pr_census_tracts,939,"Tract units used for LISA, Moran's I, and socioeconomic interpretation."
+Spatial frame,Census block groups,pr_census_block_groups,2513,Finer planning units used for aggregation and future equity analysis.
+PV labels,OSM rooftop PV polygons,pr_osm_rooftop_pv_polygons,18810,"Crowdsourced weak labels for training, validation, and exploratory adoption evidence."
+Building denominator,Overture building footprints,pr_overture_buildings,2157316,Building units used to normalize PV evidence and translate detections into planning metrics.
+Building denominator,Buildings joined to PV evidence,pr_buildings_with_pv,165008,Candidate building records that connect footprint geometry with PV label or model evidence.
+Imagery workflow,Solar tile manifest,pr_solar_tile_manifest,281633,"H3/tile-level imagery plan used to organize training, validation, and inference imagery."
+Model output,Model detection tiles,pr_solar_pv_detection_tiles,31046,Tiles where model inference results are tracked before aggregation to buildings and Census units.
+Model output,All-model PV detections,pr_solar_pv_detections_all_models,104707,Detection records from the model comparison workflow across architectures.
+Planning aggregates,PV tract aggregates,pr_pv_tract_aggregates,148,"Tract-level PV, building, socioeconomic, and context metrics used in spatial analysis."
+Planning aggregates,PV block-group aggregates,pr_pv_bg_aggregates,391,Block-group metrics prepared for finer follow-up planning interpretation.

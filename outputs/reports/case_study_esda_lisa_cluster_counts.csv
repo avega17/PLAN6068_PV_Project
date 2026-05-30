@@ -1,0 +1,61 @@
+metric,metric_slug,metric_label,municipio,lisa_cluster,lisa_cluster_label,tract_count,valid_tract_count,pct_of_valid_tracts
+any_pv_evidence_buildings_per_1000,pv_density,"Buildings with any PV evidence per 1,000 buildings",San Juan,high_high,High-High (hot spot),20,137,14.598540145985401
+any_pv_evidence_buildings_per_1000,pv_density,"Buildings with any PV evidence per 1,000 buildings",San Juan,low_low,Low-Low (cold spot),25,137,18.248175182481752
+any_pv_evidence_buildings_per_1000,pv_density,"Buildings with any PV evidence per 1,000 buildings",San Juan,high_low,High-Low (high outlier),2,137,1.4598540145985401
+any_pv_evidence_buildings_per_1000,pv_density,"Buildings with any PV evidence per 1,000 buildings",San Juan,low_high,Low-High (low outlier),3,137,2.18978102189781
+any_pv_evidence_buildings_per_1000,pv_density,"Buildings with any PV evidence per 1,000 buildings",San Juan,not_significant,Not significant,87,137,63.503649635036496
+any_pv_evidence_buildings_per_1000,pv_density,"Buildings with any PV evidence per 1,000 buildings",Isabela,high_high,High-High (hot spot),2,11,18.181818181818183
+any_pv_evidence_buildings_per_1000,pv_density,"Buildings with any PV evidence per 1,000 buildings",Isabela,low_low,Low-Low (cold spot),0,11,0.0
+any_pv_evidence_buildings_per_1000,pv_density,"Buildings with any PV evidence per 1,000 buildings",Isabela,high_low,High-Low (high outlier),1,11,9.090909090909092
+any_pv_evidence_buildings_per_1000,pv_density,"Buildings with any PV evidence per 1,000 buildings",Isabela,low_high,Low-High (low outlier),0,11,0.0
+any_pv_evidence_buildings_per_1000,pv_density,"Buildings with any PV evidence per 1,000 buildings",Isabela,not_significant,Not significant,8,11,72.72727272727273
+median_household_income_usd,income,ACS median household income (USD),San Juan,high_high,High-High (hot spot),18,127,14.173228346456693
+median_household_income_usd,income,ACS median household income (USD),San Juan,low_low,Low-Low (cold spot),19,127,14.960629921259843
+median_household_income_usd,income,ACS median household income (USD),San Juan,high_low,High-Low (high outlier),1,127,0.7874015748031497
+median_household_income_usd,income,ACS median household income (USD),San Juan,low_high,Low-High (low outlier),4,127,3.1496062992125986
+median_household_income_usd,income,ACS median household income (USD),San Juan,not_significant,Not significant,85,127,66.92913385826772
+median_household_income_usd,income,ACS median household income (USD),Isabela,high_high,High-High (hot spot),1,11,9.090909090909092
+median_household_income_usd,income,ACS median household income (USD),Isabela,low_low,Low-Low (cold spot),0,11,0.0
+median_household_income_usd,income,ACS median household income (USD),Isabela,high_low,High-Low (high outlier),0,11,0.0
+median_household_income_usd,income,ACS median household income (USD),Isabela,low_high,Low-High (low outlier),1,11,9.090909090909092
+median_household_income_usd,income,ACS median household income (USD),Isabela,not_significant,Not significant,9,11,81.81818181818181
+pct_bachelor_plus,education,Share age 25+ with Bachelor's or higher,San Juan,high_high,High-High (hot spot),25,127,19.68503937007874
+pct_bachelor_plus,education,Share age 25+ with Bachelor's or higher,San Juan,low_low,Low-Low (cold spot),19,127,14.960629921259843
+pct_bachelor_plus,education,Share age 25+ with Bachelor's or higher,San Juan,high_low,High-Low (high outlier),0,127,0.0
+pct_bachelor_plus,education,Share age 25+ with Bachelor's or higher,San Juan,low_high,Low-High (low outlier),1,127,0.7874015748031497
+pct_bachelor_plus,education,Share age 25+ with Bachelor's or higher,San Juan,not_significant,Not significant,82,127,64.56692913385827
+pct_bachelor_plus,education,Share age 25+ with Bachelor's or higher,Isabela,high_high,High-High (hot spot),1,11,9.090909090909092
+pct_bachelor_plus,education,Share age 25+ with Bachelor's or higher,Isabela,low_low,Low-Low (cold spot),0,11,0.0
+pct_bachelor_plus,education,Share age 25+ with Bachelor's or higher,Isabela,high_low,High-Low (high outlier),1,11,9.090909090909092
+pct_bachelor_plus,education,Share age 25+ with Bachelor's or higher,Isabela,low_high,Low-High (low outlier),0,11,0.0
+pct_bachelor_plus,education,Share age 25+ with Bachelor's or higher,Isabela,not_significant,Not significant,9,11,81.81818181818181
+pct_spanish_english_well_18_64,english_well,Share of Spanish-speaking adults 18-64 who speak English well,San Juan,high_high,High-High (hot spot),17,127,13.385826771653543
+pct_spanish_english_well_18_64,english_well,Share of Spanish-speaking adults 18-64 who speak English well,San Juan,low_low,Low-Low (cold spot),13,127,10.236220472440944
+pct_spanish_english_well_18_64,english_well,Share of Spanish-speaking adults 18-64 who speak English well,San Juan,high_low,High-Low (high outlier),2,127,1.5748031496062993
+pct_spanish_english_well_18_64,english_well,Share of Spanish-speaking adults 18-64 who speak English well,San Juan,low_high,Low-High (low outlier),1,127,0.7874015748031497
+pct_spanish_english_well_18_64,english_well,Share of Spanish-speaking adults 18-64 who speak English well,San Juan,not_significant,Not significant,94,127,74.01574803149606
+pct_spanish_english_well_18_64,english_well,Share of Spanish-speaking adults 18-64 who speak English well,Isabela,high_high,High-High (hot spot),0,11,0.0
+pct_spanish_english_well_18_64,english_well,Share of Spanish-speaking adults 18-64 who speak English well,Isabela,low_low,Low-Low (cold spot),1,11,9.090909090909092
+pct_spanish_english_well_18_64,english_well,Share of Spanish-speaking adults 18-64 who speak English well,Isabela,high_low,High-Low (high outlier),0,11,0.0
+pct_spanish_english_well_18_64,english_well,Share of Spanish-speaking adults 18-64 who speak English well,Isabela,low_high,Low-High (low outlier),1,11,9.090909090909092
+pct_spanish_english_well_18_64,english_well,Share of Spanish-speaking adults 18-64 who speak English well,Isabela,not_significant,Not significant,9,11,81.81818181818181
+cdc_svi_2020_overall_percentile,svi,CDC SVI 2020 overall percentile rank (0-100),San Juan,high_high,High-High (hot spot),20,130,15.384615384615385
+cdc_svi_2020_overall_percentile,svi,CDC SVI 2020 overall percentile rank (0-100),San Juan,low_low,Low-Low (cold spot),24,130,18.46153846153846
+cdc_svi_2020_overall_percentile,svi,CDC SVI 2020 overall percentile rank (0-100),San Juan,high_low,High-Low (high outlier),2,130,1.5384615384615385
+cdc_svi_2020_overall_percentile,svi,CDC SVI 2020 overall percentile rank (0-100),San Juan,low_high,Low-High (low outlier),3,130,2.3076923076923075
+cdc_svi_2020_overall_percentile,svi,CDC SVI 2020 overall percentile rank (0-100),San Juan,not_significant,Not significant,81,130,62.30769230769231
+cdc_svi_2020_overall_percentile,svi,CDC SVI 2020 overall percentile rank (0-100),Isabela,high_high,High-High (hot spot),0,11,0.0
+cdc_svi_2020_overall_percentile,svi,CDC SVI 2020 overall percentile rank (0-100),Isabela,low_low,Low-Low (cold spot),0,11,0.0
+cdc_svi_2020_overall_percentile,svi,CDC SVI 2020 overall percentile rank (0-100),Isabela,high_low,High-Low (high outlier),0,11,0.0
+cdc_svi_2020_overall_percentile,svi,CDC SVI 2020 overall percentile rank (0-100),Isabela,low_high,Low-High (low outlier),0,11,0.0
+cdc_svi_2020_overall_percentile,svi,CDC SVI 2020 overall percentile rank (0-100),Isabela,not_significant,Not significant,11,11,100.0
+nsrdb_multiyear_ghi_mean,ghi,NSRDB multiyear GHI mean (W/m2),San Juan,high_high,High-High (hot spot),44,137,32.11678832116788
+nsrdb_multiyear_ghi_mean,ghi,NSRDB multiyear GHI mean (W/m2),San Juan,low_low,Low-Low (cold spot),35,137,25.547445255474454
+nsrdb_multiyear_ghi_mean,ghi,NSRDB multiyear GHI mean (W/m2),San Juan,high_low,High-Low (high outlier),0,137,0.0
+nsrdb_multiyear_ghi_mean,ghi,NSRDB multiyear GHI mean (W/m2),San Juan,low_high,Low-High (low outlier),0,137,0.0
+nsrdb_multiyear_ghi_mean,ghi,NSRDB multiyear GHI mean (W/m2),San Juan,not_significant,Not significant,58,137,42.33576642335766
+nsrdb_multiyear_ghi_mean,ghi,NSRDB multiyear GHI mean (W/m2),Isabela,high_high,High-High (hot spot),3,11,27.272727272727273
+nsrdb_multiyear_ghi_mean,ghi,NSRDB multiyear GHI mean (W/m2),Isabela,low_low,Low-Low (cold spot),3,11,27.272727272727273
+nsrdb_multiyear_ghi_mean,ghi,NSRDB multiyear GHI mean (W/m2),Isabela,high_low,High-Low (high outlier),0,11,0.0
+nsrdb_multiyear_ghi_mean,ghi,NSRDB multiyear GHI mean (W/m2),Isabela,low_high,Low-High (low outlier),0,11,0.0
+nsrdb_multiyear_ghi_mean,ghi,NSRDB multiyear GHI mean (W/m2),Isabela,not_significant,Not significant,5,11,45.45454545454545

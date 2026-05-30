@@ -12,8 +12,7 @@ outputs/geoai_*/*
 outputs/maps/geoai_inference/*.csv
 outputs/maps/geoai_inference/*.geojson
 outputs/maps/geoai_inference/*_inference_*.png
-# notebook.link publish branch: drop rendered research notebooks but keep room
-# for a tracked slide deck under notebooks/slides/ later.
+# notebook.link: drop rendered research notebooks; keep the root slide notebook trackable.
 notebooks/**/*.ipynb
 # still WIP and way too large
 outputs/maps/pr_urban_all_geographies_preview.html
@@ -25,4 +24,28 @@ outputs/stac_tiles/*
 
 **/*.cpython-*
 **/*.duckdb
-# outputs/**/*.png
+# notebook.link presentation branch: ignore generated output PNGs unless the slide deck references them.
+outputs/**/*.png
+!outputs/figures/pr_case_study_census_hierarchy.png
+!outputs/figures/pr_pv_three_panel_example.png
+!outputs/maps/PR_STAC_raster_footprints.png
+!outputs/maps/acs_education_choropleth.png
+!outputs/maps/acs_income_choropleth.png
+!outputs/maps/acs_spanish_english_not_at_all_18_64_choropleth.png
+!outputs/maps/acs_spanish_english_well_18_64_choropleth.png
+!outputs/maps/cabo_rojo_raster_census_samples.png
+!outputs/maps/cabo_rojo_rasters_h3_pv.png
+!outputs/maps/case_study_esda_bivariate_moran_pv_covariates.png
+!outputs/maps/case_study_esda_lisa_variable_grid.png
+!outputs/maps/cdc_svi_2020_overall_percentile_choropleth.png
+!outputs/maps/dataset_split_plan_overview.png
+!outputs/maps/nsrdb_case_study_multi-year_means.png
+!outputs/maps/nsrdb_ghi_choropleth.png
+!outputs/maps/pr_macro_pv_map.png
+!outputs/maps/pv_any_evidence_per_1000_buildings_choropleth.png
+!outputs/maps/pv_building_detections_by_model_arch.png
+!outputs/maps/pv_detection_rate_choropleth.png
+!outputs/maps/pv_model_detected_per_1000_buildings_choropleth.png
+!outputs/maps/urban_land_share_choropleth.png
+!outputs/presentation/model_examples/dinov3_test_8a4cee7823a7fff_review.png
+!outputs/presentation/model_examples/smp_pan_efficientnet_b6_test_8a4cee791b2ffff_review.png
