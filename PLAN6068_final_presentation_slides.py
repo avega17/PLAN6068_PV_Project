@@ -1,8 +1,94 @@
 # %%
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
+
+
+REPO_URL = "https://github.com/avega17/PLAN6068_PV_Project.git"
+REPO_BRANCH = "nblink-publish"
+COLAB_REPO_DIR = Path("/content/PLAN6068_PV_Project")
+COLAB_REQUIRED_PACKAGES = {
+    "folium": "folium",
+    "geopandas": "geopandas",
+    "ipywidgets": "ipywidgets",
+    "lonboard": "lonboard",
+    "plotly": "plotly",
+    "pyarrow": "pyarrow",
+}
+
+
+def in_colab() -> bool:
+    return importlib.util.find_spec("google.colab") is not None
+
+
+def resolve_project_root(start: Path | None = None) -> Path:
+    current = (start or Path.cwd()).resolve()
+    markers = ("project_rules.md", ".git")
+    for candidate in (current, *current.parents):
+        if any((candidate / marker).exists() for marker in markers):
+            return candidate
+    return current
+
+
+def ensure_colab_repo(repo_dir: Path = COLAB_REPO_DIR) -> Path:
+    if repo_dir.exists() and not (repo_dir / "project_rules.md").exists():
+        shutil.rmtree(repo_dir)
+    if not repo_dir.exists():
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                REPO_BRANCH,
+                REPO_URL,
+                str(repo_dir),
+            ],
+            check=True,
+        )
+    return repo_dir
+
+
+def ensure_colab_packages() -> list[str]:
+    missing = [package for module_name, package in COLAB_REQUIRED_PACKAGES.items() if importlib.util.find_spec(module_name) is None]
+    if missing:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", *sorted(set(missing))], check=True)
+    return missing
+
+
+def prepare_runtime_workspace() -> Path:
+    project_root = resolve_project_root()
+    if any((project_root / marker).exists() for marker in ("project_rules.md", ".git")):
+        os.chdir(project_root)
+        if str(project_root) not in sys.path:
+            sys.path.insert(0, str(project_root))
+        return project_root
+
+    if not in_colab():
+        return project_root
+
+    repo_dir = ensure_colab_repo()
+    ensure_colab_packages()
+    os.chdir(repo_dir)
+    if str(repo_dir) not in sys.path:
+        sys.path.insert(0, str(repo_dir))
+    print(f"Google Colab workspace ready at {repo_dir}")
+    return repo_dir
+
+
+PROJECT_ROOT = prepare_runtime_workspace()
+OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+FIGURES_DIR = OUTPUTS_DIR / "figures"
+MAPS_DIR = OUTPUTS_DIR / "maps"
+REPORTS_DIR = OUTPUTS_DIR / "reports"
+PRESENTATION_DIR = OUTPUTS_DIR / "presentation"
 
 import folium
 import geopandas as gpd
@@ -16,23 +102,6 @@ from lonboard import Map, PolygonLayer
 from matplotlib import colormaps
 from matplotlib.colors import LogNorm
 from plotly.subplots import make_subplots
-
-
-def resolve_project_root(start: Path | None = None) -> Path:
-    current = (start or Path.cwd()).resolve()
-    markers = ("project_rules.md", ".git")
-    for candidate in (current, *current.parents):
-        if any((candidate / marker).exists() for marker in markers):
-            return candidate
-    return current
-
-
-PROJECT_ROOT = resolve_project_root()
-OUTPUTS_DIR = PROJECT_ROOT / "outputs"
-FIGURES_DIR = OUTPUTS_DIR / "figures"
-MAPS_DIR = OUTPUTS_DIR / "maps"
-REPORTS_DIR = OUTPUTS_DIR / "reports"
-PRESENTATION_DIR = OUTPUTS_DIR / "presentation"
 
 
 def artifact(relative_path: str) -> Path:
@@ -422,7 +491,7 @@ def display_building_preview_widget() -> None:
         render_building_preview,
         source=widgets.Dropdown(options=list(building_sources.keys()), description="Dataset"),
         municipality=widgets.Dropdown(options=["All", *available_municipalities], description="Municipio"),
-        max_features=widgets.IntSlider(value=6000, min=1000, max=75000, step=1000, description="Render cap"),
+        max_features=widgets.IntSlider(value=6000, min=1000, max=150000, step=1000, description="Render cap"),
     )
     caption("Lonboard preview of the selected building-footprint scope. Heights are explicit where available, otherwise inferred from floors or assigned a minimal preview elevation.")
 
@@ -461,11 +530,61 @@ def display_bivariate_morans_table() -> None:
     )
     caption("Bivariate Moran summaries compare tract PV density with neighboring tract context variables; they are screening results, not causal estimates.")
 
+# %%
+presentation_manifest = read_manifest()
+selected_building_export = presentation_manifest.get("selected_building_export", {})
+building_sources = load_building_sources()
+available_municipalities = sorted(
+    {
+        municipality
+        for gdf in building_sources.values()
+        for municipality in gdf["municipality_name"].dropna().unique().tolist()
+    }
+)
+MAX_BUILDING_RENDER_CAP = max(1000, ((max(len(gdf) for gdf in building_sources.values()) + 999) // 1000) * 1000)
+
+
+def display_building_export_candidates() -> None:
+    candidate_df = pd.DataFrame(presentation_manifest.get("building_export_candidates", []))
+    if candidate_df.empty:
+        display(candidate_df)
+        return
+    selected_scope = selected_building_export.get("scope")
+    candidate_df = candidate_df.assign(
+        buildings=lambda frame: frame["rows"].map(lambda value: f"{int(value):,}"),
+        role=lambda frame: np.where(frame["scope"].eq(selected_scope), "Selected interactive preview", "Alternative scope reviewed"),
+    )[["label", "buildings", "role"]]
+    display(candidate_df)
+    caption("Building-footprint scopes reviewed for the interactive preview. The selected full San Juan plus Isabela scope now retains both municipalities while the render cap keeps browser exploration manageable.")
+
+
+def display_building_preview_widget() -> None:
+    widgets.interact(
+        render_building_preview,
+        source=widgets.Dropdown(options=list(building_sources.keys()), description="Dataset"),
+        municipality=widgets.Dropdown(options=["All", *available_municipalities], description="Municipio"),
+        max_features=widgets.IntSlider(value=min(6000, MAX_BUILDING_RENDER_CAP), min=1000, max=MAX_BUILDING_RENDER_CAP, step=1000, description="Render cap"),
+    )
+    caption("Lonboard preview of the full selected building-footprint scope. Heights are explicit where available, otherwise inferred from floors or assigned a minimal preview elevation.")
+
+# %% [markdown]
+# ## Google Colab Setup Preface
+# 
+# This presentation is now intended to run from the [nblink-publish branch](https://github.com/avega17/PLAN6068_PV_Project/tree/nblink-publish) in Google Colab.
+# 
+# 1. Run the first code cell. In Colab it clones the repo into `/content/PLAN6068_PV_Project`, installs any missing presentation packages, switches the working directory to the repo root, and makes the helper modules plus presentation artifacts available.
+# 2. Run the second code cell to load the compact presentation artifacts and helper functions used by the slides.
+# 3. Focus the cover slide and start slideshow mode from that cell with `View > Start slideshow`, `Ctrl` + `Shift` + `P` then `Start notebook slideshow`, or `Alt` + `V`.
+# 4. To restart from the first cell, use `View > Start slideshow from beginning` or `Alt` + `Shift` + `V`.
+# 5. Appending `#slideshowMode=true` to a shared Colab URL opens directly in slideshow mode.
+# 
+# If slideshow mode closes, press `Escape` or the `x` button, focus the desired cell again, and restart the slideshow. For stability across presentations, Colab also lets you pin a specific runtime version from `Runtime > Change runtime type`.
+
 # %% [markdown]
 # <div class="cover-slide">
 #   <div class="cover-kicker" align="right">PLAN 6068 Final Project</div>
 #   <h1 align="center">Geospatial Data Pipelines for Rooftop Solar Detection in Puerto Rico</h1>
-#   <div class="cover-subtitle" align="center"> <h4> A notebook.link slide deck on crowdsourced PV labels, building footprints, computer vision experiments, and exploratory spatial analysis for municipal energy planning.</h4></div>
+#   <div class="cover-subtitle" align="center"> <h4> A Python notebook slide deck on crowdsourced PV labels, building footprints, computer vision experiments, and exploratory spatial analysis for municipal energy planning.</h4></div>
 #   <div class="cover-meta">
 #     <div align="center"><strong>Alejandro S. Vega-Nogales</strong> (801-13-7956) | M.S. Candidate, Computer Science, University of Puerto Rico - Río Piedras</div>
 #     <div align="center">PLAN 6068: AI Applications in Planning | Prof. J. Ayala Hernandez</div>
@@ -534,6 +653,7 @@ display_capacity_chart()
 # The initial SNIC/superpixel island-wide segmentation methodology from [8] was set aside because the engineering burden was not the segmentation algorithm alone. The harder problem was consistent imagery, clean geometry alignment, availability of 4-band imagery, and enough trustworthy labels to evaluate building-level usefulness.
 
 # %%
+# needs to be re-run due to platform size constraints
 display_case_study_micro_map()
 
 # %% [markdown]
@@ -642,7 +762,7 @@ display_building_preview_widget()
 # <li><strong>Modeling stack:</strong> segmentation and feature-extraction experiments around Meta's SAM3 and DINOv3 models, and proven semantic segmentation architectures.</li>
 # <li><strong>Agentic workflow:</strong> Github Copilot <a href="https://github.blog/ai-and-ml/github-copilot/agent-mode-101-all-about-github-copilots-powerful-mode/">Agent mode</a> was used for implementation drafts, refactors, and validation scaffolding; every high-risk step was checked against real local data outputs using our agent's access to our database.</li>
 # <li><strong>Documentation context:</strong> library docs and external examples were treated as part of the prompt, especially for geospatial packages whose APIs change quickly.</li>
-# <li><strong>Notebook.link sharing:</strong> the platform provides a full in-browser JupyterLab workspace plus presentation slides view, making it useful for sharing complex, multi-file repositories with helper modules, maps, and interactive outputs rather than only a single static notebook that needs to fetch any external resources.</li>
+# <li><strong>Google Colab sharing:</strong> the deck can clone the <code>nblink-publish</code> branch into <code>/content</code>, load compact presentation artifacts, and use slideshow mode to present from the cover slide or any focused cell.</li>
 # </ul>
 
 # %% [markdown]
@@ -788,7 +908,7 @@ display_bivariate_morans_table()
 # 
 # <ul class="tight-list">
 # <li>The ongoing project now has a reproducible local geospatial database connecting OSM PV labels, Overture buildings, Census/SVI variables, raster catalogs, and NSRDB context.</li>
-# <li>Notebook.link makes the work shareable as a browser-based project workspace: reviewers can open the deck, inspect repository files, and interact with maps and tables from one link rather than only viewing a static notebook.</li>
+# <li>Google Colab makes the work shareable as a browser-based project workspace: reviewers can clone the branch into <code>/content</code>, inspect repository files, and present or rerun the interactive slides from one notebook.</li>
 # <li>San Juan and Isabela provide a reasonable contrastive case-study proof-of-concept for my intended thesis project.</li>
 # <li>OSM labels are valuable but must be treated as biased weak supervision that enables model training and evaluation, but with inconsistent coverage and label definitions rather than ground truth adoption counts.</li>
 # </ul>

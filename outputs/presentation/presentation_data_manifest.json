@@ -1,7 +1,7 @@
 {
   "building_export_candidates": [
     {
-      "duckdb_bytes": 36712448,
+      "duckdb_bytes": 34877440,
       "label": "San Juan + Isabela",
       "parquet_bytes": 17609166,
       "rows": 165008,
@@ -15,44 +15,44 @@
       "scope": "san_juan"
     },
     {
-      "duckdb_bytes": 11808768,
+      "duckdb_bytes": 30158848,
       "label": "San Juan: Puerto Nuevo + sampled buildings",
-      "max_extra_san_juan_sample_rows": 60349,
-      "parquet_bytes": 5547191,
+      "max_extra_san_juan_sample_rows": 109520,
+      "parquet_bytes": 14620755,
       "puerto_nuevo_rows": 16557,
-      "rows": 46731,
+      "rows": 126077,
       "scope": "san_juan_puerto_nuevo_sample",
-      "selected_bytes": 5547191,
-      "selected_extra_san_juan_sample_rows": 30174,
-      "selected_rows": 46731
+      "selected_bytes": 14620755,
+      "selected_extra_san_juan_sample_rows": 109520,
+      "selected_rows": 126077
     },
     {
-      "duckdb_bytes": 7090176,
+      "duckdb_bytes": 5517312,
       "label": "Isabela",
       "parquet_bytes": 3345747,
       "rows": 38931,
       "scope": "isabela"
     },
     {
-      "duckdb_bytes": 4468736,
+      "duckdb_bytes": 4993024,
       "label": "high-coverage barrios",
       "parquet_bytes": 2361175,
       "rows": 20092,
       "scope": "high_coverage_barrios"
     }
   ],
-  "building_export_max_bytes": 9000000,
+  "building_export_max_bytes": 25000000,
   "case_municipality_count": 2,
   "case_pv_polygon_count": 11412,
   "output_file_bytes": {
     "case_study_high_coverage_barrios.geojson": 26822,
     "case_study_municipalities.geojson": 17478,
     "case_study_osm_pv_polygons.geojson": 4169363,
-    "case_study_overture_buildings.parquet": 5547191,
+    "case_study_overture_buildings.parquet": 17609166,
     "case_study_overture_buildings_preview.parquet": 608831,
     "model_examples/dinov3_test_8a4cee7823a7fff_review.png": 1591226,
     "model_examples/smp_pan_efficientnet_b6_test_8a4cee791b2ffff_review.png": 1413679,
-    "presentation_data_manifest.json": 2775,
+    "presentation_data_manifest.json": 2654,
     "research_database_summary.csv": 1746
   },
   "output_files": [
@@ -68,15 +68,10 @@
   ],
   "research_database_summary_rows": 11,
   "selected_building_export": {
-    "duckdb_bytes": 11808768,
-    "label": "San Juan: Puerto Nuevo + sampled buildings",
-    "max_extra_san_juan_sample_rows": 60349,
-    "parquet_bytes": 5547191,
-    "puerto_nuevo_rows": 16557,
-    "rows": 46731,
-    "scope": "san_juan_puerto_nuevo_sample",
-    "selected_bytes": 5547191,
-    "selected_extra_san_juan_sample_rows": 30174,
-    "selected_rows": 46731
+    "duckdb_bytes": 34877440,
+    "label": "San Juan + Isabela",
+    "parquet_bytes": 17609166,
+    "rows": 165008,
+    "scope": "case_municipalities"
   }
 }
